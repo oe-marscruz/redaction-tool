@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/RedactionTool/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller spec cache
+.spec_cache/
+*.egg-info/
+
+# Temp / test output files
+selftest_result.txt
+exe_selftest.txt
+*.tmp
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
