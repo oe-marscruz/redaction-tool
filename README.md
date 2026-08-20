@@ -68,40 +68,38 @@ Originals are **never modified**. Output files are written as
 `<name>_REDACTED.<ext>` next to the source or into a chosen output folder.
 The tool refuses to write output over the source file.
 
-## Quick start
+## Quick start — no install required
 
-Double-click **`Run-RedactionTool.bat`** — it launches the included standalone
-exe, or auto-installs Python dependencies if running from source.
+1. [Download **RedactionTool.exe** from the latest Release](https://github.com/oe-marscruz/redaction-tool/releases/latest)
+2. Double-click it. That's it.
 
-## Standalone executable (recommended)
+The exe is a **fully self-contained single-file build** — the Python
+runtime and every dependency are bundled inside. Nothing to install, no
+network access needed. This is the safest option for sensitive data.
 
-`dist\RedactionTool.exe` is a **fully self-contained single-file build** —
-the Python runtime and every dependency (PyMuPDF, python-docx, openpyxl,
-tkinterdnd2) are bundled inside it. The host computer needs **nothing
-installed**: no Python, no packages, no network access. Just copy the exe
-anywhere and double-click it. This is the safest option for sensitive data
-because the tool never touches the network.
-
-If the exe is not included in your download (e.g. a git clone), rebuild it:
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt pyinstaller
-pyinstaller --noconfirm RedactionTool.spec
-```
-
-Validate the packaged exe on any machine (headless, writes `OK`/`FAIL`):
+Validate the exe on any machine (headless, writes `OK`/`FAIL`):
 
 ```
 RedactionTool.exe --selftest result.txt
 ```
 
-Rebuild it yourself after changing the code:
+## Run from source (alternative)
+
+If you cloned the repo and don't have the exe, double-click
+**`Run-RedactionTool.bat`** — it creates a venv and **auto-installs any
+missing dependencies** before launching. Manual equivalent:
 
 ```bash
-cd RedactionTool
+cd redaction-tool
+python -m venv .venv
 .venv\Scripts\activate
+pip install -r requirements.txt
+python run.py
+```
+
+To build your own exe after making changes:
+
+```bash
 pip install pyinstaller
 pyinstaller --noconfirm RedactionTool.spec
 ```
@@ -110,29 +108,11 @@ pyinstaller --noconfirm RedactionTool.spec
 > heuristics (a known PyInstaller false positive). If that happens, build
 > folder mode instead: `pyinstaller --noconfirm --onedir run.py`.
 
-## Run from source
-
-Double-click **`Run-RedactionTool.bat`** — it launches the exe when present,
-or otherwise creates a venv and **auto-installs any missing dependencies**
-before starting the app. Manual equivalent:
-
-```bash
-cd RedactionTool
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python run.py
-```
-
-## Validate (headless self-test, from source)
+Run the headless self-test from source:
 
 ```bash
 python run.py --selftest result.txt
 ```
-
-Builds sample PDF/DOCX/XLSX files containing known PII, redacts them, and
-verifies nothing leaks. Writes `OK` or `FAIL` plus a per-format report to
-`result.txt`.
 
 ## Important compliance notes
 
@@ -167,6 +147,5 @@ verifies nothing leaks. Writes `OK` or `FAIL` plus a per-format report to
 - `RedactionTool.spec` — PyInstaller one-file build config
 - `Run-RedactionTool.bat` — double-click launcher (exe, or auto-installs
   deps and runs from source)
-- `dist/RedactionTool.exe` — the built standalone executable
 - `validate_real_files.py` — regression harness: redacts copies of real case
   files into a temp folder and verifies subject identifiers don't leak

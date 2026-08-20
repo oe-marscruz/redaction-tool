@@ -3,7 +3,7 @@
 
 # PyInstaller build artifacts
 build/
-dist/RedactionTool/
+dist/
 
 # Python bytecode
 __pycache__/
