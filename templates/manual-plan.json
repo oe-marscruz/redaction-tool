@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "source": {"name": "SOURCE_FILE", "type": "pdf"},
+  "settings": {"dpi": 200, "ocr_language": "eng"},
+  "detections": [
+    {
+      "id": "manual-0001",
+      "page": 1,
+      "entity_type": "MANUAL",
+      "source": "manual",
+      "bbox": [0, 0, 100, 50],
+      "coordinate_space": "pdf_points",
+      "ocr_confidence": null,
+      "detector_confidence": 1.0,
+      "preview": "[MANUAL REDACTION]",
+      "sha256": null,
+      "action": "redact"
+    }
+  ],
+  "warnings": []
+}

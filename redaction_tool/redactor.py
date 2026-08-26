@@ -38,7 +38,7 @@ try:
 except Exception:
     _XLSX_OK = False
 
-SUPPORTED_EXTENSIONS: set[str] = {".pdf", ".docx", ".xlsx"}
+SUPPORTED_EXTENSIONS: set[str] = {".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 DEFAULT_REPLACEMENT = "[REDACTED]"
 
@@ -370,9 +370,17 @@ def _pdf_to_images(pdf_path: Path, out_dir: Path, fmt: str = "PNG") -> list[Path
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_text(src_path: str | Path) -> str:
-    """Extract full text from a document (used for scan previews)."""
+    """Extract full text from a document (used for scan previews).
+
+    Image-only PDFs and standalone images will return an empty string —
+    use ``ocr.scan_ocr_pdf()`` or ``ocr.scan_ocr_image()`` for those.
+    """
     src = Path(src_path)
     ext = src.suffix.lower()
+
+    if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+        # Standalone images have no native text layer.
+        return ""
 
     if ext == ".pdf":
         if not _PDF_OK:

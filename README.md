@@ -130,20 +130,51 @@ python run.py --selftest result.txt
    unambiguous — surnames alone ("Drollinger") and uncommon first names need
    the **Extra literal texts** box. Always add each case subject's full name
    there.
-4. Scanned/image-only PDFs have no text layer — detection will find nothing.
-   Such documents need OCR first (not included). The scan step will show
-   zero detections for these files — treat that as a warning, not a pass.
+4. Scanned/image-only PDFs have no text layer — detection finds nothing
+   without OCR.  Enable the **OCR checkbox** to process these (requires
+   a local Tesseract installation); see the OCR section below.
 5. The bare 7–10 digit number pattern (unique IDs) may catch benign long
    numbers; disable `unique_ids` in a custom preset if that is too aggressive
    for your documents.
 
+## OCR support (scanned & image-only documents)
+
+When **Enable OCR** is checked (requires a local Tesseract installation),
+the tool renders PDF pages to images, runs OCR with word-level bounding
+boxes, and applies redactions using the same 19-category detection
+pipeline. This covers:
+
+- **Image-only / scanned PDFs** (the ones that show "0 detections" without
+  OCR — treat that as a warning, not a pass).
+- **Mixed PDFs** with native text on some pages and scanned content on
+  others.
+- **Standalone images**: PNG, JPEG, TIFF, BMP, WebP.
+
+To use it:
+
+1. [Install Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
+   (free, offline).  Make sure `tesseract.exe` is on your PATH or set the
+   `TESSERACT_CMD` environment variable.
+2. Tick **Enable OCR** in the output options.
+3. Scan and redact as usual — OCR detections are merged with text-based
+   results. Image-only files are handled exclusively via OCR.
+
+OCR is accurate for machine-printed text at reasonable resolution.
+Handwriting, stylized fonts, and low-resolution scans will produce
+low-confidence results surfaced as warnings.
+
 ## Project layout
 
+- `redaction_tool/ocr.py` — OCR engine (scan → plan → apply → verify)
 - `redaction_tool/detector.py` — PII/PHI patterns, built-in presets, `detect()`
 - `redaction_tool/redactor.py` — per-format redaction engines + image output
 - `redaction_tool/presets.py` — custom preset save/load/delete (JSON)
 - `redaction_tool/gui.py` — Tkinter desktop app (drag & drop via tkinterdnd2)
 - `run.py` — launcher with `--selftest`
+- `references/` — methodology, plan schema, entity policy docs
+- `templates/`, `examples/` — sample redaction plan files
+- `SKILL.md` — Hermes/Bionic AI agent skill definition
+- `tests/` — unit tests + dependency checker
 - `RedactionTool.spec` — PyInstaller one-file build config
 - `Run-RedactionTool.bat` — double-click launcher (exe, or auto-installs
   deps and runs from source)

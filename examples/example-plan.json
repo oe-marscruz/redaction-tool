@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "source": {"name": "example.pdf", "type": "pdf"},
+  "settings": {"dpi": 200, "ocr_language": "eng", "presidio": false},
+  "detections": [
+    {
+      "id": "d00001",
+      "page": 1,
+      "entity_type": "US_SSN",
+      "source": "ocr-regex",
+      "bbox": [110.0, 205.0, 184.0, 218.0],
+      "coordinate_space": "pdf_points",
+      "ocr_confidence": 96.2,
+      "detector_confidence": 1.0,
+      "preview": "***6789",
+      "sha256": "example-only-no-sensitive-value",
+      "action": "redact"
+    }
+  ],
+  "warnings": []
+}

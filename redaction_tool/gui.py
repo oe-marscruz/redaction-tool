@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import detector, presets, redactor
+from . import detector, ocr, presets, redactor
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -74,10 +75,12 @@ THEMES: dict[str, dict[str, str]] = {
 _SETTINGS_PATH = presets._presets_dir().parent / "settings.json"
 
 FILE_TYPES = [
+    ("All supported", "*.pdf *.docx *.xlsx *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp"),
     ("Documents", "*.pdf *.docx *.xlsx"),
     ("PDF files", "*.pdf"),
     ("Word documents", "*.docx"),
     ("Excel workbooks", "*.xlsx"),
+    ("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp"),
     ("All files", "*.*"),
 ]
 
@@ -332,8 +335,26 @@ class App:
         tk.Entry(opt_row, textvariable=self.replacement_var, font=("Segoe UI", 9),
                  width=14, relief="flat").pack(side="left", padx=8)
 
+        ocr_row = tk.Frame(out_frame, bg=t["bg"])
+        ocr_row.pack(fill="x", pady=(8, 0))
+        self.ocr_enabled_var = tk.BooleanVar(value=False)
+        tesseract_found = ocr.find_tesseract() is not None
+        ocr_text = "Enable OCR (scanned/image-only documents)"
+        if not tesseract_found:
+            ocr_text += " — Tesseract not found"
+        self.ocr_cb = tk.Checkbutton(ocr_row, text=ocr_text,
+                                      variable=self.ocr_enabled_var,
+                                      font=("Segoe UI", 10),
+                                      bg=t["bg"], fg=t["fg"],
+                                      activebackground=t["bg"],
+                                      activeforeground=t["fg"],
+                                      selectcolor=t["surface"])
+        self.ocr_cb.pack(side="left")
+        if not tesseract_found:
+            self.ocr_cb.configure(state="disabled")
+
         img_row = tk.Frame(out_frame, bg=t["bg"])
-        img_row.pack(fill="x", pady=(8, 0))
+        img_row.pack(fill="x", pady=(4, 0))
         self.image_var = tk.BooleanVar(value=False)
         tk.Checkbutton(img_row, text="Also render redacted PDFs as images",
                        variable=self.image_var, font=("Segoe UI", 10),
@@ -513,21 +534,60 @@ class App:
             messagebox.showinfo("No files", "Add at least one document first.")
             return
         opts = self._scan_options()
+        use_ocr = (self.ocr_enabled_var.get()
+                   and ocr.find_tesseract() is not None)
         lines: list[str] = []
         total_all = 0
-        for i, path in enumerate(self.files, 1):
-            name = os.path.basename(path)
+        for i, path_str in enumerate(self.files, 1):
+            path = Path(path_str)
+            name = path.name
             self.status.config(text=f"Scanning {i}/{len(self.files)}: {name}…")
             self.root.update_idletasks()
-            try:
-                counts = redactor.scan_file(path, opts)
-            except Exception as exc:  # noqa: BLE001
-                lines.append(f"{name}:  ERROR — {exc}")
-                continue
+
+            counts: dict[str, int] = {}
+            ext = path.suffix.lower()
+
+            # Image-only files always use OCR
+            if ext in ocr.IMAGE_EXTS:
+                if use_ocr:
+                    try:
+                        plan = ocr.scan_ocr_image(path, scan_opts=opts)
+                        for d in plan["detections"]:
+                            cat = d["entity_type"]
+                            counts[cat] = counts.get(cat, 0) + 1
+                    except Exception as exc:  # noqa: BLE001
+                        lines.append(f"{name}:  OCR ERROR — {exc}")
+                        continue
+                else:
+                    lines.append(f"{name}:  Image file — enable OCR to scan")
+                    continue
+            else:
+                # Text-based: run normal scan + optional OCR
+                try:
+                    text_counts = redactor.scan_file(path, opts)
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"{name}:  ERROR — {exc}")
+                    continue
+                # Merge text results
+                for cat, n in text_counts.items():
+                    counts[cat] = counts.get(cat, 0) + n
+
+                # If PDF is image-only (0 text) and OCR enabled, add OCR
+                if ext == ".pdf" and use_ocr:
+                    if sum(text_counts.values()) == 0:
+                        lines.append(f"  (text layer is empty — running OCR)")
+                    try:
+                        plan = ocr.scan_ocr_pdf(path, scan_opts=opts)
+                        for d in plan["detections"]:
+                            cat = d["entity_type"]
+                            counts[cat] = counts.get(cat, 0) + 1
+                    except Exception as exc:  # noqa: BLE001
+                        lines.append(f"  OCR ERROR — {exc}")
+
             total = sum(counts.values())
             total_all += total
             lines.append(f"{name}:  {total} item(s) detected")
-            for cat, n in counts.items():
+            for cat, n in sorted(counts.items()):
                 label = detector.CATEGORY_MAP.get(cat)
                 lines.append(f"    {label.label if label else cat}: {n}")
         lines.append("")
@@ -550,13 +610,38 @@ class App:
         opts = self._scan_options()
         out_dir = self._out_dir()
         suffix = self.suffix_var.get() or "_REDACTED"
+        use_ocr = (self.ocr_enabled_var.get()
+                   and ocr.find_tesseract() is not None)
         lines: list[str] = []
         ok, failed = 0, 0
 
-        for i, path in enumerate(self.files, 1):
-            name = os.path.basename(path)
+        for i, path_str in enumerate(self.files, 1):
+            path = Path(path_str)
+            name = path.name
             self.status.config(text=f"Redacting {i}/{len(self.files)}: {name}…")
             self.root.update_idletasks()
+            ext = path.suffix.lower()
+
+            if ext in ocr.IMAGE_EXTS:
+                # Image-only: use OCR redaction exclusively
+                if not use_ocr:
+                    failed += 1
+                    lines.append(f"{name}:  ERROR — OCR must be enabled for images")
+                    continue
+                out_path = (Path(out_dir) / f"{path.stem}{suffix}{ext}"
+                            if out_dir else path.with_name(f"{path.stem}{suffix}{ext}"))
+                try:
+                    plan = ocr.scan_ocr_image(path, scan_opts=opts)
+                    ocr.apply_ocr_redactions(path, plan, out_path)
+                    ok += 1
+                    lines.append(f"{name}:  {len(plan['detections'])} OCR redaction(s) applied")
+                    lines.append(f"    → {out_path}")
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    lines.append(f"{name}:  OCR ERROR — {exc}")
+                continue
+
+            # Text-based documents — run standard redaction first
             result = redactor.redact_file(
                 path, opts, out_dir=out_dir, suffix=suffix,
                 image_output=self.image_var.get(),
@@ -565,11 +650,27 @@ class App:
             if result.error:
                 failed += 1
                 lines.append(f"{name}:  ERROR — {result.error}")
-            else:
-                ok += 1
-                lines.append(f"{name}:  {result.redaction_count} redaction(s) applied")
-                for out in result.outputs:
-                    lines.append(f"    → {out}")
+                continue
+
+            # If OCR enabled, also apply OCR redactions on top
+            if use_ocr and ext == ".pdf":
+                redacted_pdf = result.outputs[0]
+                try:
+                    ocr_plan = ocr.scan_ocr_pdf(redacted_pdf, scan_opts=opts)
+                    if ocr_plan["detections"]:
+                        # Build a plan for the original, then apply to
+                        # the redacted output (in-place overlay)
+                        temp = redacted_pdf.with_suffix(".ocr_tmp.pdf")
+                        ocr.apply_ocr_redactions(redacted_pdf, ocr_plan, temp)
+                        temp.replace(redacted_pdf)
+                        lines.append(f"  + {len(ocr_plan['detections'])} OCR overlay redaction(s)")
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"  OCR pass skipped — {exc}")
+
+            ok += 1
+            lines.append(f"{name}:  {result.redaction_count} redaction(s) applied")
+            for out in result.outputs:
+                lines.append(f"    → {out}")
 
         self._write_results(lines)
         msg = f"Redacted {ok} of {len(self.files)} file(s)."
