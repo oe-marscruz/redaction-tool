@@ -70,6 +70,49 @@ class ScanOptions:
 # PDF
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _scrub_pdf_links(doc, opts: ScanOptions) -> int:
+    """Delete link annotations whose URIs contain detected PII.
+
+    Link URIs (e.g. ``mailto:...?ssn=...``) are invisible metadata that
+    survives text redaction — verify by re-opening the output.
+    Returns the number of links removed.
+    """
+    removed = 0
+    for page in doc:
+        for lnk in page.get_links():
+            uri = lnk.get("uri", "") or ""
+            target = lnk.get("nameddest", "") or ""
+            if not uri and not target:
+                continue
+            if opts.run_detection(uri) or opts.run_detection(target):
+                page.delete_link(lnk)
+                removed += 1
+    return removed
+
+
+def _scrub_pdf_attachments(doc, opts: ScanOptions) -> int:
+    """Remove embedded files whose content contains detected PII.
+
+    Attachments are opaque containers we cannot reliably redact in place,
+    so any attachment whose bytes trip the detector is dropped entirely.
+    Returns the number of attachments removed.
+    """
+    removed = 0
+    for i in range(doc.embfile_count() - 1, -1, -1):
+        try:
+            data = doc.embfile_get(i)
+        except Exception:
+            continue
+        if not data:
+            continue
+        # latin-1 maps every byte to a codepoint — safe lossless probe.
+        probe = data.decode("latin-1", errors="ignore")
+        if opts.run_detection(probe):
+            doc.embfile_del(i)
+            removed += 1
+    return removed
+
+
 def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     """Permanently redact a PDF via PyMuPDF redaction annotations."""
     doc = fitz.open(str(src))
@@ -100,6 +143,11 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
         # PDF_REDACT_IMAGE_NONE keeps embedded images intact; text under the
         # redaction rect is removed from the content stream.
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+    # Scrub invisible containers that survive text redaction:
+    # link URIs (mailto:...?ssn=...) and embedded file attachments.
+    total += _scrub_pdf_links(doc, opts)
+    total += _scrub_pdf_attachments(doc, opts)
 
     # Scrub metadata (author, creator, etc. can leak identities).
     try:
@@ -187,6 +235,79 @@ def _mask_paragraph(paragraph, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     return masked, per_cat
 
 
+def _redact_docx_textboxes(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
+    """Redact text inside drawing text boxes (w:txbxContent).
+
+    python-docx's paragraph API does not cover text inside shapes, so this
+    walks the raw XML of every story part (body, headers, footers) and masks
+    detected spans in the underlying ``w:t`` elements.  Without this, PII in
+    letterhead text boxes survives redaction untouched.
+    """
+    from docx.oxml.ns import qn
+
+    W_P = qn("w:p")
+    W_T = qn("w:t")
+    total = 0
+    per_cat: dict[str, int] = {}
+
+    for part in document.part.package.iter_parts():
+        root = getattr(part, "element", None)
+        if root is None:
+            continue
+        for txbx in root.iter(qn("w:txbxContent")):
+            for w_p in txbx.iter(W_P):
+                t_elems = list(w_p.iter(W_T))
+                if not t_elems:
+                    continue
+                texts = [t.text or "" for t in t_elems]
+                full = "".join(texts)
+                matches = opts.run_detection(full)
+                if not matches:
+                    continue
+
+                # Offset map: paragraph coordinates → per-w:t coordinates.
+                spans: list[tuple[int, int, object]] = []
+                pos = 0
+                for t_el, txt in zip(t_elems, texts):
+                    spans.append((pos, pos + len(txt), t_el))
+                    pos += len(txt)
+
+                run_edits: dict[int, list[tuple[int, int, str]]] = {}
+                for m in matches:
+                    inserted = False
+                    for idx, (start, end, _t) in enumerate(spans):
+                        if end <= m.start or start >= m.end:
+                            continue
+                        ls = max(m.start, start) - start
+                        le = min(m.end, end) - start
+                        repl = opts.replacement if not inserted else ""
+                        run_edits.setdefault(idx, []).append((ls, le, repl))
+                        inserted = True
+                    if inserted:
+                        per_cat[m.category] = per_cat.get(m.category, 0) + 1
+                        total += 1
+
+                for idx, edits in run_edits.items():
+                    t_el = spans[idx][2]
+                    txt = texts[idx]
+                    edits.sort()
+                    merged: list[list] = []
+                    for ls, le, repl in edits:
+                        if merged and ls <= merged[-1][1]:
+                            merged[-1][1] = max(merged[-1][1], le)
+                        else:
+                            merged.append([ls, le, repl])
+                    new_parts: list[str] = []
+                    cursor = 0
+                    for ls, le, repl in merged:
+                        new_parts.append(txt[cursor:ls])
+                        new_parts.append(repl)
+                        cursor = le
+                    new_parts.append(txt[cursor:])
+                    t_el.text = "".join(new_parts)
+    return total, per_cat
+
+
 def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     document = docx.Document(str(src))
     total = 0
@@ -221,6 +342,10 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
                 continue
             _process_paragraphs(part.paragraphs)
             _process_tables(part.tables)
+
+    # Text boxes / shapes (letterhead PII lives here — python-docx's
+    # paragraph API never sees it)
+    _accumulate(*_redact_docx_textboxes(document, opts))
 
     # Scrub document properties.
     try:
@@ -448,6 +573,24 @@ def redact_file(src_path: str | Path,
     try:
         if ext not in SUPPORTED_EXTENSIONS:
             raise ValueError(f"Unsupported file type: {ext}")
+
+        # Standalone images are redacted exclusively via the OCR engine.
+        if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+            from . import ocr as _ocr
+            if not _ocr.find_tesseract():
+                raise RuntimeError(
+                    "Tesseract OCR is required for image files. Install it from "
+                    "https://github.com/UB-Mannheim/tesseract/wiki")
+            plan = _ocr.scan_ocr_image(src, scan_opts=opts)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            _ocr.apply_ocr_redactions(src, plan, out_path)
+            result.redaction_count = len(plan["detections"])
+            for d in plan["detections"]:
+                result.per_category[d["entity_type"]] = \
+                    result.per_category.get(d["entity_type"], 0) + 1
+            result.outputs.append(out_path)
+            return result
+
         missing = {".pdf": (not _PDF_OK, "PyMuPDF (fitz)"),
                    ".docx": (not _DOCX_OK, "python-docx"),
                    ".xlsx": (not _XLSX_OK, "openpyxl")}[ext]
@@ -545,7 +688,18 @@ def scan_file(src_path: str | Path, opts: ScanOptions) -> dict[str, int]:
     match what a redaction pass will actually mask.
     """
     src = Path(src_path)
-    if src.suffix.lower() == ".xlsx":
+    ext = src.suffix.lower()
+
+    # Standalone images: counts come from the OCR pipeline.
+    if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+        from . import ocr as _ocr
+        plan = _ocr.scan_ocr_image(src, scan_opts=opts)
+        counts: dict[str, int] = {}
+        for d in plan["detections"]:
+            counts[d["entity_type"]] = counts.get(d["entity_type"], 0) + 1
+        return dict(sorted(counts.items()))
+
+    if ext == ".xlsx":
         _total, per_cat = _process_xlsx(src, opts, out=None)
         return dict(sorted(per_cat.items()))
     counts: dict[str, int] = {}

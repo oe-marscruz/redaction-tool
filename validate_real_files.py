@@ -5,6 +5,7 @@ Checks that known PII (subject names from the filenames) is gone from the
 redacted output text, and reports detection counts.
 """
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
