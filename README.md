@@ -163,6 +163,42 @@ OCR is accurate for machine-printed text at reasonable resolution.
 Handwriting, stylized fonts, and low-resolution scans will produce
 low-confidence results surfaced as warnings.
 
+## Verification & audit trail
+
+- **Auto-verify**: after every redaction batch, each output file is
+  re-scanned and reported as `PASS` (zero residual detections) or
+  `NEEDS_REVIEW`. A standalone **Verify Last Batch** button re-runs this
+  on demand.
+- **Audit log**: each batch writes `redaction_log_<timestamp>.json` next
+  to the outputs — source file, preset, per-category counts, verify
+  result, and timestamp for every entry.
+- **Redaction plans**: OCR-processed files also save a detailed
+  `<name>_plan.json` with bounding boxes and masked previews.
+- **Salted fingerprints**: plan fingerprints use a random per-batch salt
+  (`hash_salt` in the log) — unsalted SHA-256 of short values like SSNs
+  would be brute-forceable.
+
+## Hidden-content coverage
+
+Beyond visible text, the tool also scrubs:
+
+| Container | Formats | Behavior |
+|---|---|---|
+| Link annotation URIs (`mailto:?ssn=…`) | PDF | Deleted when they trip the detector |
+| Embedded file attachments | PDF | Removed when their content contains PII |
+| AcroForm field values | PDF | Field deleted + area blacked out |
+| Text boxes / shapes | DOCX | Masked via raw XML walk |
+| Footnotes, endnotes, comments | DOCX | Masked via raw XML walk |
+| Cell comments / notes | XLSX | Removed when they contain PII |
+| Print headers / footers | XLSX | Cleared when they contain PII |
+| `docProps/app.xml` Manager/Company | DOCX, XLSX | Blanket-cleared |
+| Document metadata (author, etc.) | All | Blanket-cleared |
+
+Optional **Presidio NER** (Microsoft, local in-process) can supplement
+name detection in OCR pipelines: `pip install -r requirements-presidio-optional.txt`
+then tick *Presidio NER*. The tool never starts a Presidio server and
+works fully offline without it.
+
 ## Project layout
 
 - `redaction_tool/ocr.py` — OCR engine (scan → plan → apply → verify)
@@ -180,3 +216,4 @@ low-confidence results surfaced as warnings.
   deps and runs from source)
 - `validate_real_files.py` — regression harness: redacts copies of real case
   files into a temp folder and verifies subject identifiers don't leak
+- `.github/workflows/ci.yml` — CI: syntax check, unit tests, self-test

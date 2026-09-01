@@ -170,25 +170,90 @@ def span_bbox(words: list[OCRWord], start: int, end: int,
 
 # ── Detection (integrated with our full detector) ──────────────────────────
 
+# Optional Presidio entity types → our category keys.
+_PRESIDIO_CATEGORY_MAP = {
+    "PERSON": "names",
+    "LOCATION": "addresses",
+    "ORGANIZATION": "names",
+    "EMAIL_ADDRESS": "emails",
+    "PHONE_NUMBER": "phones",
+    "US_SSN": "ssn",
+    "IP_ADDRESS": "ips",
+    "URL": "urls",
+    "DATE_TIME": "dates",
+}
+
+
+def _presidio_spans(text: str) -> tuple[list[tuple[int, int, str, str, float]], list[str]]:
+    """Run optional local Presidio NER.  Returns (spans, warnings).
+
+    Never imports or starts any server — presidio-analyzer runs in-process.
+    """
+    warnings: list[str] = []
+    try:
+        from presidio_analyzer import AnalyzerEngine
+    except ImportError:
+        return [], ["Presidio requested but presidio-analyzer is not installed "
+                    "— NER skipped."]
+    try:
+        analyzer = getattr(_presidio_spans, "_engine", None)
+        if analyzer is None:
+            analyzer = AnalyzerEngine()
+            _presidio_spans._engine = analyzer  # cache across pages
+        spans: list[tuple[int, int, str, str, float]] = []
+        for res in analyzer.analyze(text=text, language="en"):
+            spans.append((res.start, res.end, res.entity_type,
+                          text[res.start:res.end], float(res.score)))
+        return spans, warnings
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"Presidio analysis failed: {exc}"]
+
+
 def detect_on_ocr(words: list[OCRWord],
                   scan_opts: Optional["redactor_ScanOptions"] = None,
-                  ) -> list[dict]:
+                  ) -> tuple[list[dict], list[str]]:
     """Run our 19-category detector against OCR-extracted text.
 
     Each match is converted to a redaction-plan entry with pixel-coordinate
     bounding boxes, masked previews (never full sensitive values), and
-    SHA-256 fingerprints.
+    salted SHA-256 fingerprints (unsalted hashes of short values such as
+    SSNs are brute-forceable).
+
+    Returns (plan_entries, warnings).
     """
     from .redactor import ScanOptions  # late import to avoid circular
     opts = scan_opts or ScanOptions()
     text = ocr_text(words)
     matches = opts.run_detection(text)  # uses our full detector.py
+    warnings: list[str] = []
+
+    # Optional local Presidio NER (covers names the built-in list misses).
+    if getattr(opts, "use_presidio", False):
+        spans, pres_warnings = _presidio_spans(text)
+        warnings.extend(pres_warnings)
+        for start, end, entity_type, value, score in spans:
+            matches.append(detector.Match(
+                text=value,
+                category=_PRESIDIO_CATEGORY_MAP.get(entity_type, "custom"),
+                start=start,
+                end=end,
+            ))
+        # Re-deduplicate after merging.
+        matches = _dedupe_matches(matches)
+
+    salt = getattr(opts, "hash_salt", "") or ""
 
     plan_entries: list[dict] = []
-    for idx, m in enumerate(matches, 1):
+    seen_spans: set[tuple[int, int]] = set()
+    idx = 0
+    for m in matches:
+        if (m.start, m.end) in seen_spans:
+            continue
+        seen_spans.add((m.start, m.end))
         bb = span_bbox(words, m.start, m.end)
         if not bb:
             continue
+        idx += 1
         left, top, right, bottom, conf = bb
         entry = {
             "id": f"ocr-{idx:05d}",
@@ -200,11 +265,25 @@ def detect_on_ocr(words: list[OCRWord],
             "ocr_confidence": round(float(conf), 2) if conf >= 0 else None,
             "detector_confidence": 1.0,
             "preview": _mask_value(m.category, m.text),
-            "sha256": hashlib.sha256(m.text.encode("utf-8")).hexdigest(),
+            "sha256": hashlib.sha256((salt + m.text).encode("utf-8")).hexdigest(),
             "action": "redact",
         }
         plan_entries.append(entry)
-    return plan_entries
+    return plan_entries, warnings
+
+
+def _dedupe_matches(matches: list):
+    """Keep the longest match when ranges overlap."""
+    matches.sort(key=lambda x: (x.start, -(x.end - x.start)))
+    deduped: list = []
+    for m in matches:
+        if deduped and m.start < deduped[-1].end:
+            if (m.end - m.start) > (deduped[-1].end - deduped[-1].start):
+                deduped[-1] = m
+            continue
+        deduped.append(m)
+    deduped.sort(key=lambda x: x.start)
+    return deduped
 
 
 def _mask_value(category: str, value: str) -> str:
@@ -310,7 +389,8 @@ def scan_ocr_pdf(pdf_path: Path, dpi: int = 200, lang: str = "eng",
             except Exception as exc:
                 plan["warnings"].append(f"Page {pno}: OCR failed — {exc}")
                 continue
-            entries = detect_on_ocr(words, scan_opts=opts)
+            entries, page_warnings = detect_on_ocr(words, scan_opts=opts)
+            plan["warnings"].extend(page_warnings)
             for entry in entries:
                 detection_idx += 1
                 entry["id"] = f"d{detection_idx:05d}"
@@ -336,7 +416,8 @@ def scan_ocr_image(image_path: Path, lang: str = "eng",
     opts = scan_opts or ScanOptions()
     plan = new_plan(image_path.name, "image", lang=lang)
     words = run_ocr(image_path, lang=lang, tesseract_cmd=tesseract_cmd)
-    entries = detect_on_ocr(words, scan_opts=opts)
+    entries, warnings = detect_on_ocr(words, scan_opts=opts)
+    plan["warnings"].extend(warnings)
     for i, entry in enumerate(entries, 1):
         entry["id"] = f"d{i:05d}"
         entry["page"] = 1

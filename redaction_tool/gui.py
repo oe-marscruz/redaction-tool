@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import secrets
+import threading
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -114,6 +118,8 @@ class App:
         self.t = THEMES[self.theme_name]
 
         self.files: list[str] = []
+        self.last_outputs: list[Path] = []
+        self._batch_queue: queue.Queue | None = None
         self._build_ui()
         self._bind_dnd(root)
         self._apply_theme()
@@ -352,6 +358,14 @@ class App:
         self.ocr_cb.pack(side="left")
         if not tesseract_found:
             self.ocr_cb.configure(state="disabled")
+        self.presidio_var = tk.BooleanVar(value=False)
+        self.presidio_cb = tk.Checkbutton(
+            ocr_row, text="Presidio NER (if installed)",
+            variable=self.presidio_var, font=("Segoe UI", 9),
+            bg=t["bg"], fg=t["muted"], activebackground=t["bg"],
+            activeforeground=t["fg"], selectcolor=t["surface"])
+        self.presidio_cb._theme_role = "muted"
+        self.presidio_cb.pack(side="left", padx=(12, 0))
 
         img_row = tk.Frame(out_frame, bg=t["bg"])
         img_row.pack(fill="x", pady=(4, 0))
@@ -368,10 +382,17 @@ class App:
         # ── Actions ───────────────────────────────────────────────────────
         actions = tk.Frame(self.root, bg=t["bg"])
         actions.pack(fill="x", **pad)
-        self._button(actions, "Scan (preview counts)", self.scan_files,
-                     "accent", font_size=11, bold=True).pack(side="left")
-        self._button(actions, "Redact All", self.redact_all,
-                     "danger", font_size=11, bold=True).pack(side="left", padx=10)
+        self.scan_btn = self._button(actions, "Scan (preview counts)", self.scan_files,
+                                     "accent", font_size=11, bold=True)
+        self.scan_btn.pack(side="left")
+        self.redact_btn = self._button(actions, "Redact All", self.redact_all,
+                                       "danger", font_size=11, bold=True)
+        self.redact_btn.pack(side="left", padx=10)
+        self.verify_btn = self._button(actions, "Verify Last Batch",
+                                       self.verify_last_batch,
+                                       "green", font_size=11, bold=True,
+                                       state="disabled")
+        self.verify_btn.pack(side="left")
 
         # Scan results
         results_wrap = tk.Frame(self.root, bg=t["bg"])
@@ -391,7 +412,8 @@ class App:
         self.status.pack(fill="x", side="bottom")
 
     def _button(self, parent, text: str, command, role: str,
-                font_size: int = 10, bold: bool = False) -> tk.Button:
+                font_size: int = 10, bold: bool = False,
+                state: str = "normal") -> tk.Button:
         """Create a themed button; role ∈ accent|danger|purple|green|gray|plain."""
         t = self.t
         palette = {
@@ -407,7 +429,8 @@ class App:
         btn = tk.Button(parent, text=text, command=command, font=font,
                         bg=bg, fg=fg, activebackground=hover,
                         activeforeground=fg, padx=12, pady=3, relief="flat",
-                        cursor="hand2")
+                        cursor="hand2", state=state,
+                        disabledforeground=t["muted"])
         btn._theme_role = role
         return btn
 
@@ -510,7 +533,7 @@ class App:
             return None
         return v
 
-    def _scan_options(self) -> redactor.ScanOptions:
+    def _scan_options(self, salt: str = "") -> redactor.ScanOptions:
         texts = [ln.strip() for ln in self.custom_texts.get("1.0", "end").splitlines()
                  if ln.strip()]
         patterns = [ln.strip() for ln in
@@ -520,6 +543,8 @@ class App:
             custom_patterns=patterns or None,
             custom_texts=texts or None,
             replacement=self.replacement_var.get() or redactor.DEFAULT_REPLACEMENT,
+            hash_salt=salt,
+            use_presidio=self.presidio_var.get(),
         )
 
     def _write_results(self, lines: list[str]) -> None:
@@ -529,71 +554,103 @@ class App:
         self.results.configure(state="disabled")
 
     # ------------------------------------------------------------- actions
+    # ----------------------------------------------------- batch engine
+    def _build_payload(self, salt: str) -> dict:
+        """Gather all settings on the main thread before the worker starts."""
+        return {
+            "files": list(self.files),
+            "opts": self._scan_options(salt=salt),
+            "use_ocr": (self.ocr_enabled_var.get()
+                        and ocr.find_tesseract() is not None),
+            "out_dir": self._out_dir(),
+            "suffix": self.suffix_var.get() or "_REDACTED",
+            "preset": self.preset_var.get(),
+            "image_output": self.image_var.get(),
+            "image_format": self.image_fmt_var.get(),
+        }
+
+    def _start_batch(self, kind: str, payload: dict) -> None:
+        self._batch_queue: queue.Queue = queue.Queue()
+        self._set_batch_ui(running=True)
+        worker = threading.Thread(
+            target=self._batch_worker, args=(kind, payload, self._batch_queue),
+            daemon=True)
+        worker.start()
+        self.root.after(100, self._poll_batch, kind)
+
+    def _set_batch_ui(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for btn in (self.scan_btn, self.redact_btn):
+            btn.config(state=state)
+        if running:
+            self.verify_btn.config(state="disabled")
+
+    def _poll_batch(self, kind: str) -> None:
+        q = self._batch_queue
+        done = None
+        if q is not None:
+            try:
+                while True:
+                    msg = q.get_nowait()
+                    if msg[0] == "progress":
+                        self.status.config(text=msg[1])
+                    elif msg[0] == "done":
+                        done = msg[1]
+            except queue.Empty:
+                pass
+        if done is not None:
+            self._batch_queue = None
+            self._finish_batch(kind, done)
+        else:
+            self.root.after(100, self._poll_batch, kind)
+
+    def _finish_batch(self, kind: str, done: dict) -> None:
+        self._set_batch_ui(running=False)
+        self._write_results(done["lines"])
+        if kind == "redact":
+            self.last_outputs = done.get("outputs", [])
+            self.verify_btn.config(
+                state="normal" if self.last_outputs else "disabled")
+            msg = f"Redacted {done['ok']} of {done['total']} file(s)."
+            if done["failed"]:
+                msg += f"\n{done['failed']} file(s) failed — see list above."
+            if done.get("log_path"):
+                msg += f"\nAudit log: {done['log_path']}"
+            self.status.config(text=msg.replace("\n", " "))
+            messagebox.showinfo("Redaction complete", msg)
+        elif kind == "verify":
+            msg = (f"Verification: {done['pass_count']} PASS, "
+                   f"{done['review_count']} NEEDS_REVIEW "
+                   f"(of {done['total']} file(s)).\n"
+                   "See the results list for details.")
+            self.status.config(text=msg.replace("\n", " "))
+            messagebox.showinfo("Verification complete", msg)
+
+    # Verify a single redacted output.  For PDFs with OCR enabled the OCR
+    # pass covers both the text layer and raster content; otherwise the
+    # text-based detector re-scans the output.
+    def _verify_one(self, path: Path, opts, use_ocr: bool) -> dict:
+        ext = path.suffix.lower()
+        try:
+            if ext in ocr.IMAGE_EXTS or (ext == ".pdf" and use_ocr):
+                v = ocr.verify_ocr(path, scan_opts=opts)
+                return {"status": v["status"],
+                        "residual": v["remaining_detection_count"],
+                        "warnings": v["warnings"]}
+            counts = redactor.scan_file(path, opts)
+            n = sum(counts.values())
+            return {"status": "PASS" if n == 0 else "NEEDS_REVIEW",
+                    "residual": n, "warnings": []}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "residual": None, "warnings": [str(exc)]}
+
+    # ------------------------------------------------------------- actions
     def scan_files(self) -> None:
         if not self.files:
             messagebox.showinfo("No files", "Add at least one document first.")
             return
-        opts = self._scan_options()
-        use_ocr = (self.ocr_enabled_var.get()
-                   and ocr.find_tesseract() is not None)
-        lines: list[str] = []
-        total_all = 0
-        for i, path_str in enumerate(self.files, 1):
-            path = Path(path_str)
-            name = path.name
-            self.status.config(text=f"Scanning {i}/{len(self.files)}: {name}…")
-            self.root.update_idletasks()
-
-            counts: dict[str, int] = {}
-            ext = path.suffix.lower()
-
-            # Image-only files always use OCR
-            if ext in ocr.IMAGE_EXTS:
-                if use_ocr:
-                    try:
-                        plan = ocr.scan_ocr_image(path, scan_opts=opts)
-                        for d in plan["detections"]:
-                            cat = d["entity_type"]
-                            counts[cat] = counts.get(cat, 0) + 1
-                    except Exception as exc:  # noqa: BLE001
-                        lines.append(f"{name}:  OCR ERROR — {exc}")
-                        continue
-                else:
-                    lines.append(f"{name}:  Image file — enable OCR to scan")
-                    continue
-            else:
-                # Text-based: run normal scan + optional OCR
-                try:
-                    text_counts = redactor.scan_file(path, opts)
-                except Exception as exc:  # noqa: BLE001
-                    lines.append(f"{name}:  ERROR — {exc}")
-                    continue
-                # Merge text results
-                for cat, n in text_counts.items():
-                    counts[cat] = counts.get(cat, 0) + n
-
-                # If PDF is image-only (0 text) and OCR enabled, add OCR
-                if ext == ".pdf" and use_ocr:
-                    if sum(text_counts.values()) == 0:
-                        lines.append(f"  (text layer is empty — running OCR)")
-                    try:
-                        plan = ocr.scan_ocr_pdf(path, scan_opts=opts)
-                        for d in plan["detections"]:
-                            cat = d["entity_type"]
-                            counts[cat] = counts.get(cat, 0) + 1
-                    except Exception as exc:  # noqa: BLE001
-                        lines.append(f"  OCR ERROR — {exc}")
-
-            total = sum(counts.values())
-            total_all += total
-            lines.append(f"{name}:  {total} item(s) detected")
-            for cat, n in sorted(counts.items()):
-                label = detector.CATEGORY_MAP.get(cat)
-                lines.append(f"    {label.label if label else cat}: {n}")
-        lines.append("")
-        lines.append(f"TOTAL: {total_all} item(s) across {len(self.files)} file(s)")
-        self._write_results(lines)
-        self.status.config(text="Scan complete. Review counts, then Redact All.")
+        salt = secrets.token_hex(16)
+        self._start_batch("scan", self._build_payload(salt))
 
     def redact_all(self) -> None:
         if not self.files:
@@ -606,63 +663,197 @@ class App:
             "Redacted copies will be written with the configured suffix; "
             "originals are never modified."):
             return
+        salt = secrets.token_hex(16)
+        self._start_batch("redact", self._build_payload(salt))
 
-        opts = self._scan_options()
-        out_dir = self._out_dir()
-        suffix = self.suffix_var.get() or "_REDACTED"
-        use_ocr = (self.ocr_enabled_var.get()
-                   and ocr.find_tesseract() is not None)
+    def verify_last_batch(self) -> None:
+        if not self.last_outputs:
+            messagebox.showinfo("Nothing to verify",
+                                "Redact a batch first, then verify.")
+            return
+        payload = self._build_payload(salt=secrets.token_hex(16))
+        payload["outputs"] = list(self.last_outputs)
+        self._start_batch("verify", payload)
+
+    # --------------------------------------------------- batch workers
+    # These run on a background thread — no tkinter calls here.  Progress
+    # and the final result go through the queue.
+    def _batch_worker(self, kind: str, payload: dict, q: queue.Queue) -> None:
+        try:
+            if kind == "scan":
+                q.put(("done", self._scan_worker(payload, q)))
+            elif kind == "verify":
+                q.put(("done", self._verify_worker(payload, q)))
+            else:
+                q.put(("done", self._redact_worker(payload, q)))
+        except Exception as exc:  # noqa: BLE001 — never hang the UI
+            q.put(("done", {"lines": [f"BATCH ERROR: {exc}"], "ok": 0,
+                            "failed": 0, "total": 0, "outputs": []}))
+
+    def _scan_worker(self, payload: dict, q: queue.Queue) -> dict:
+        opts = payload["opts"]
+        use_ocr = payload["use_ocr"]
+        files = payload["files"]
         lines: list[str] = []
-        ok, failed = 0, 0
-
-        for i, path_str in enumerate(self.files, 1):
+        total_all = 0
+        for i, path_str in enumerate(files, 1):
             path = Path(path_str)
             name = path.name
-            self.status.config(text=f"Redacting {i}/{len(self.files)}: {name}…")
-            self.root.update_idletasks()
+            q.put(("progress", f"Scanning {i}/{len(files)}: {name}…"))
+            counts: dict[str, int] = {}
             ext = path.suffix.lower()
 
             if ext in ocr.IMAGE_EXTS:
-                # Image-only: use OCR redaction exclusively
+                if not use_ocr:
+                    lines.append(f"{name}:  Image file — enable OCR to scan")
+                    continue
+                try:
+                    plan = ocr.scan_ocr_image(path, scan_opts=opts)
+                    for d in plan["detections"]:
+                        counts[d["entity_type"]] = counts.get(d["entity_type"], 0) + 1
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"{name}:  OCR ERROR — {exc}")
+                    continue
+            else:
+                try:
+                    text_counts = redactor.scan_file(path, opts)
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"{name}:  ERROR — {exc}")
+                    continue
+                for cat, n in text_counts.items():
+                    counts[cat] = counts.get(cat, 0) + n
+                if ext == ".pdf" and use_ocr:
+                    if sum(text_counts.values()) == 0:
+                        lines.append("  (text layer is empty — running OCR)")
+                    try:
+                        plan = ocr.scan_ocr_pdf(path, scan_opts=opts)
+                        for d in plan["detections"]:
+                            counts[d["entity_type"]] = counts.get(d["entity_type"], 0) + 1
+                    except Exception as exc:  # noqa: BLE001
+                        lines.append(f"  OCR ERROR — {exc}")
+
+            total = sum(counts.values())
+            total_all += total
+            lines.append(f"{name}:  {total} item(s) detected")
+            for cat, n in sorted(counts.items()):
+                label = detector.CATEGORY_MAP.get(cat)
+                lines.append(f"    {label.label if label else cat}: {n}")
+        lines.append("")
+        lines.append(f"TOTAL: {total_all} item(s) across {len(files)} file(s)")
+        return {"lines": lines}
+
+    def _verify_worker(self, payload: dict, q: queue.Queue) -> dict:
+        opts = payload["opts"]
+        use_ocr = payload["use_ocr"]
+        outputs = payload["outputs"]
+        lines: list[str] = []
+        pass_count = review_count = 0
+        for i, path in enumerate(outputs, 1):
+            q.put(("progress", f"Verifying {i}/{len(outputs)}: {path.name}…"))
+            v = self._verify_one(path, opts, use_ocr)
+            if v["status"] == "PASS":
+                pass_count += 1
+            elif v["status"] in ("NEEDS_REVIEW", "ERROR"):
+                review_count += 1
+            lines.append(f"{path.name}:  VERIFY {v['status']} "
+                         f"(residual={v['residual']})")
+            for w in v["warnings"]:
+                lines.append(f"    warning: {w}")
+        lines.append("")
+        lines.append(f"RESULT: {pass_count} PASS, {review_count} NEEDS_REVIEW")
+        return {"lines": lines, "pass_count": pass_count,
+                "review_count": review_count, "total": len(outputs)}
+
+    def _redact_worker(self, payload: dict, q: queue.Queue) -> dict:
+        opts = payload["opts"]
+        use_ocr = payload["use_ocr"]
+        files = payload["files"]
+        out_dir = payload["out_dir"]
+        suffix = payload["suffix"]
+        preset = payload["preset"]
+        lines: list[str] = []
+        outputs: list[Path] = []
+        log_entries: list[dict] = []
+        ok = failed = 0
+
+        for i, path_str in enumerate(files, 1):
+            path = Path(path_str)
+            name = path.name
+            q.put(("progress", f"Redacting {i}/{len(files)}: {name}…"))
+            entry: dict = {
+                "source": str(path),
+                "preset": preset,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "hash_salt": opts.hash_salt,
+                "ocr_used": False,
+                "errors": [],
+            }
+            ext = path.suffix.lower()
+
+            if ext in ocr.IMAGE_EXTS:
                 if not use_ocr:
                     failed += 1
+                    entry["errors"].append("OCR must be enabled for image files")
                     lines.append(f"{name}:  ERROR — OCR must be enabled for images")
+                    log_entries.append(entry)
                     continue
                 out_path = (Path(out_dir) / f"{path.stem}{suffix}{ext}"
-                            if out_dir else path.with_name(f"{path.stem}{suffix}{ext}"))
+                            if out_dir
+                            else path.with_name(f"{path.stem}{suffix}{ext}"))
                 try:
                     plan = ocr.scan_ocr_image(path, scan_opts=opts)
                     ocr.apply_ocr_redactions(path, plan, out_path)
                     ok += 1
+                    entry["outputs"] = [str(out_path)]
+                    entry["ocr_used"] = True
+                    entry["plan"] = {"detections": len(plan["detections"]),
+                                     "warnings": plan["warnings"]}
                     lines.append(f"{name}:  {len(plan['detections'])} OCR redaction(s) applied")
                     lines.append(f"    → {out_path}")
+                    outputs.append(out_path)
+                    # Persist the full redaction plan (audit artifact).
+                    try:
+                        plan_path = out_path.with_suffix(out_path.suffix + ".plan.json")
+                        plan_path.write_text(json.dumps(plan, indent=2),
+                                             encoding="utf-8")
+                        entry["plan_file"] = str(plan_path)
+                    except Exception:
+                        pass
                 except Exception as exc:  # noqa: BLE001
                     failed += 1
+                    entry["errors"].append(str(exc))
                     lines.append(f"{name}:  OCR ERROR — {exc}")
+                log_entries.append(entry)
                 continue
 
-            # Text-based documents — run standard redaction first
+            # Text-based documents — standard redaction first.
             result = redactor.redact_file(
                 path, opts, out_dir=out_dir, suffix=suffix,
-                image_output=self.image_var.get(),
-                image_format=self.image_fmt_var.get(),
+                image_output=payload["image_output"],
+                image_format=payload["image_format"],
             )
             if result.error:
                 failed += 1
+                entry["errors"].append(result.error)
                 lines.append(f"{name}:  ERROR — {result.error}")
+                log_entries.append(entry)
                 continue
 
-            # If OCR enabled, also apply OCR redactions on top
+            entry["outputs"] = [str(o) for o in result.outputs]
+            entry["redaction_count"] = result.redaction_count
+            entry["per_category"] = result.per_category
+
+            # If OCR enabled, apply OCR redactions on top of the text pass.
             if use_ocr and ext == ".pdf":
                 redacted_pdf = result.outputs[0]
                 try:
                     ocr_plan = ocr.scan_ocr_pdf(redacted_pdf, scan_opts=opts)
                     if ocr_plan["detections"]:
-                        # Build a plan for the original, then apply to
-                        # the redacted output (in-place overlay)
                         temp = redacted_pdf.with_suffix(".ocr_tmp.pdf")
                         ocr.apply_ocr_redactions(redacted_pdf, ocr_plan, temp)
                         temp.replace(redacted_pdf)
+                        entry["ocr_used"] = True
+                        entry["ocr_overlay"] = len(ocr_plan["detections"])
                         lines.append(f"  + {len(ocr_plan['detections'])} OCR overlay redaction(s)")
                 except Exception as exc:  # noqa: BLE001
                     lines.append(f"  OCR pass skipped — {exc}")
@@ -671,14 +862,45 @@ class App:
             lines.append(f"{name}:  {result.redaction_count} redaction(s) applied")
             for out in result.outputs:
                 lines.append(f"    → {out}")
+                outputs.append(out)
 
-        self._write_results(lines)
-        msg = f"Redacted {ok} of {len(self.files)} file(s)."
-        if failed:
-            msg += f"\n{failed} file(s) failed — see list above."
-        self.status.config(text=msg.replace("\n", " "))
-        messagebox.showinfo("Redaction complete", msg)
+            # Verify the primary output immediately.
+            primary = result.outputs[0]
+            q.put(("progress", f"Verifying {name}…"))
+            v = self._verify_one(primary, opts, use_ocr)
+            entry["verify"] = v
+            lines.append(f"    VERIFY: {v['status']} (residual={v['residual']})")
+            for w in v["warnings"]:
+                lines.append(f"      warning: {w}")
+            log_entries.append(entry)
 
+        # Persist the batch audit log next to the outputs.
+        log_path = None
+        if log_entries:
+            try:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base = Path(out_dir) if out_dir else Path(files[0]).parent
+                log_path = base / f"redaction_log_{stamp}.json"
+                log_path.write_text(json.dumps({
+                    "tool_version": _tool_version(),
+                    "preset": preset,
+                    "hash_salt": opts.hash_salt,
+                    "replacement": opts.replacement,
+                    "entries": log_entries,
+                }, indent=2), encoding="utf-8")
+                lines.append("")
+                lines.append(f"Audit log: {log_path}")
+            except Exception:
+                pass
+
+        return {"lines": lines, "ok": ok, "failed": failed,
+                "total": len(files), "outputs": outputs,
+                "log_path": str(log_path) if log_path else None}
+
+
+def _tool_version() -> str:
+    from . import __version__
+    return __version__
 
 class CustomizerDialog:
     """Checkbox dialog for toggling categories and saving custom presets."""

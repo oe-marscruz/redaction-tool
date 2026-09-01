@@ -60,6 +60,13 @@ class ScanOptions:
     custom_patterns: list[str] | None = None
     custom_texts: list[str] | None = None
     replacement: str = DEFAULT_REPLACEMENT
+    # Salt mixed into plan-file SHA-256 fingerprints.  Unsalted hashes of
+    # short values (SSNs) are brute-forceable, so every batch gets a random
+    # salt that is stored alongside the plan.
+    hash_salt: str = ""
+    # Optional local Presidio NER (only used by the OCR pipeline; silently
+    # skipped when presidio-analyzer is not installed).
+    use_presidio: bool = False
 
     def run_detection(self, text: str) -> list[Match]:
         return detect(text, self.enabled_categories,
@@ -69,6 +76,35 @@ class ScanOptions:
 # ═══════════════════════════════════════════════════════════════════════════
 # PDF
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _scrub_pdf_widgets(page, opts: ScanOptions) -> int:
+    """Delete form-field widgets whose stored values or names contain PII.
+
+    AcroForm field values are not part of the page text stream, so text
+    redaction never sees them.  A redaction box is drawn over the widget
+    area before deletion so any flattened appearance remnants are covered.
+    Returns the number of widgets removed.
+    """
+    removed = 0
+    widgets = list(page.widgets())
+    for w in widgets:
+        value = str(getattr(w, "field_value", "") or "")
+        name = str(getattr(w, "field_name", "") or "")
+        if opts.run_detection(value) or opts.run_detection(name):
+            try:
+                page.add_redact_annot(w.rect, fill=(0, 0, 0))
+            except Exception:
+                pass
+            try:
+                page.delete_widget(w)
+            except Exception:
+                try:
+                    w.delete()
+                except Exception:
+                    continue
+            removed += 1
+    return removed
+
 
 def _scrub_pdf_links(doc, opts: ScanOptions) -> int:
     """Delete link annotations whose URIs contain detected PII.
@@ -120,6 +156,9 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
     per_cat: dict[str, int] = {}
 
     for page in doc:
+        # Form-field values are not part of the text stream — scrub widgets
+        # on every page, including pages with no extractable text.
+        total += _scrub_pdf_widgets(page, opts)
         page_text = page.get_text()
         if not page_text.strip():
             continue
@@ -235,77 +274,159 @@ def _mask_paragraph(paragraph, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     return masked, per_cat
 
 
-def _redact_docx_textboxes(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
-    """Redact text inside drawing text boxes (w:txbxContent).
+# Parts whose entire content lives outside the python-docx object model.
+_DOCX_HIDDEN_PART_SUFFIXES = (
+    "footnotes.xml", "endnotes.xml", "comments.xml",
+)
 
-    python-docx's paragraph API does not cover text inside shapes, so this
-    walks the raw XML of every story part (body, headers, footers) and masks
-    detected spans in the underlying ``w:t`` elements.  Without this, PII in
-    letterhead text boxes survives redaction untouched.
+
+def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
+    """Redact text python-docx's API cannot reach:
+
+    - drawing text boxes (``w:txbxContent``) in any story part;
+    - footnotes, endnotes, and comments (loaded as opaque blob parts with
+      no ``.element``), patched by re-serializing their XML.
+
+    Without this, PII in letterhead shapes or footnote text survives
+    redaction untouched.
     """
     from docx.oxml.ns import qn
+    from lxml import etree
 
     W_P = qn("w:p")
     W_T = qn("w:t")
     total = 0
     per_cat: dict[str, int] = {}
 
+    def _mask_paragraph(w_p) -> tuple[int, dict[str, int]]:
+        """Mask detected spans across the w:t elements of one raw w:p."""
+        count = 0
+        cats: dict[str, int] = {}
+        t_elems = list(w_p.iter(W_T))
+        if not t_elems:
+            return 0, {}
+        texts = [t.text or "" for t in t_elems]
+        full = "".join(texts)
+        matches = opts.run_detection(full)
+        if not matches:
+            return 0, {}
+
+        spans: list[tuple[int, int, object]] = []
+        pos = 0
+        for t_el, txt in zip(t_elems, texts):
+            spans.append((pos, pos + len(txt), t_el))
+            pos += len(txt)
+
+        run_edits: dict[int, list[tuple[int, int, str]]] = {}
+        for m in matches:
+            inserted = False
+            for idx, (start, end, _t) in enumerate(spans):
+                if end <= m.start or start >= m.end:
+                    continue
+                ls = max(m.start, start) - start
+                le = min(m.end, end) - start
+                repl = opts.replacement if not inserted else ""
+                run_edits.setdefault(idx, []).append((ls, le, repl))
+                inserted = True
+            if inserted:
+                cats[m.category] = cats.get(m.category, 0) + 1
+                count += 1
+
+        for idx, edits in run_edits.items():
+            t_el = spans[idx][2]
+            txt = texts[idx]
+            edits.sort()
+            merged: list[list] = []
+            for ls, le, repl in edits:
+                if merged and ls <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], le)
+                else:
+                    merged.append([ls, le, repl])
+            new_parts: list[str] = []
+            cursor = 0
+            for ls, le, repl in merged:
+                new_parts.append(txt[cursor:ls])
+                new_parts.append(repl)
+                cursor = le
+            new_parts.append(txt[cursor:])
+            t_el.text = "".join(new_parts)
+        return count, cats
+
     for part in document.part.package.iter_parts():
+        partname = str(getattr(part, "partname", ""))
         root = getattr(part, "element", None)
-        if root is None:
+
+        if root is not None:
+            # Structured parts (body, headers, footers): text boxes only.
+            for txbx in root.iter(qn("w:txbxContent")):
+                for w_p in txbx.iter(W_P):
+                    n, cats = _mask_paragraph(w_p)
+                    total += n
+                    for k, v in cats.items():
+                        per_cat[k] = per_cat.get(k, 0) + v
             continue
-        for txbx in root.iter(qn("w:txbxContent")):
-            for w_p in txbx.iter(W_P):
-                t_elems = list(w_p.iter(W_T))
-                if not t_elems:
-                    continue
-                texts = [t.text or "" for t in t_elems]
-                full = "".join(texts)
-                matches = opts.run_detection(full)
-                if not matches:
-                    continue
 
-                # Offset map: paragraph coordinates → per-w:t coordinates.
-                spans: list[tuple[int, int, object]] = []
-                pos = 0
-                for t_el, txt in zip(t_elems, texts):
-                    spans.append((pos, pos + len(txt), t_el))
-                    pos += len(txt)
-
-                run_edits: dict[int, list[tuple[int, int, str]]] = {}
-                for m in matches:
-                    inserted = False
-                    for idx, (start, end, _t) in enumerate(spans):
-                        if end <= m.start or start >= m.end:
-                            continue
-                        ls = max(m.start, start) - start
-                        le = min(m.end, end) - start
-                        repl = opts.replacement if not inserted else ""
-                        run_edits.setdefault(idx, []).append((ls, le, repl))
-                        inserted = True
-                    if inserted:
-                        per_cat[m.category] = per_cat.get(m.category, 0) + 1
-                        total += 1
-
-                for idx, edits in run_edits.items():
-                    t_el = spans[idx][2]
-                    txt = texts[idx]
-                    edits.sort()
-                    merged: list[list] = []
-                    for ls, le, repl in edits:
-                        if merged and ls <= merged[-1][1]:
-                            merged[-1][1] = max(merged[-1][1], le)
-                        else:
-                            merged.append([ls, le, repl])
-                    new_parts: list[str] = []
-                    cursor = 0
-                    for ls, le, repl in merged:
-                        new_parts.append(txt[cursor:ls])
-                        new_parts.append(repl)
-                        cursor = le
-                    new_parts.append(txt[cursor:])
-                    t_el.text = "".join(new_parts)
+        # Opaque blob parts (footnotes / endnotes / comments): parse, mask,
+        # and re-serialize the whole part.
+        if not partname.endswith(_DOCX_HIDDEN_PART_SUFFIXES):
+            continue
+        try:
+            blob = part.blob
+            if not blob:
+                continue
+            root = etree.fromstring(blob)
+        except Exception:
+            continue
+        part_count = 0
+        for w_p in root.iter(W_P):
+            n, cats = _mask_paragraph(w_p)
+            part_count += n
+            total += n
+            for k, v in cats.items():
+                per_cat[k] = per_cat.get(k, 0) + v
+        if part_count:
+            try:
+                part._blob = etree.tostring(
+                    root, xml_declaration=True, encoding="UTF-8", standalone=True)
+            except Exception:
+                pass
     return total, per_cat
+
+
+def _redact_docx_textboxes(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
+    """Backward-compatible alias for the generalized hidden-parts scrub."""
+    return _redact_docx_hidden_parts(document, opts)
+
+
+def _scrub_opc_app_xml(path: Path) -> None:
+    """Blank Manager / Company fields in docProps/app.xml of an OPC file.
+
+    python-docx and openpyxl don't expose app properties, but 'Manager' can
+    contain a person's name.  Rewrites the zip in place when a change is
+    needed.  Applies to DOCX and XLSX output files.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "docProps/app.xml" not in z.namelist():
+                return
+            data = z.read("docProps/app.xml")
+        new = re.sub(rb"<Manager>.*?</Manager>", b"<Manager></Manager>",
+                     data, flags=re.S)
+        new = re.sub(rb"<Company>.*?</Company>", b"<Company></Company>",
+                     new, flags=re.S)
+        if new == data:
+            return
+        tmp = path.with_suffix(path.suffix + ".appxml_tmp")
+        with zipfile.ZipFile(path) as zin, \
+                zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                content = new if item.filename == "docProps/app.xml" \
+                    else zin.read(item.filename)
+                zout.writestr(item, content)
+        tmp.replace(path)
+    except Exception:
+        pass
 
 
 def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str, int]]:
@@ -360,6 +481,7 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
         pass
 
     document.save(str(out))
+    _scrub_opc_app_xml(out)
     return total, per_cat
 
 
@@ -420,6 +542,19 @@ def _process_xlsx(src: Path, opts: ScanOptions,
         header_cols = _header_columns(ws, enabled)
         for row in ws.iter_rows():
             for cell in row:
+                # Cell comments / notes — invisible in the grid, but part
+                # of the file.  Check every cell (clean values can still
+                # carry PII in their comment).
+                comment = getattr(cell, "comment", None)
+                if comment is not None:
+                    c_matches = opts.run_detection(comment.text or "")
+                    if c_matches:
+                        for m in c_matches:
+                            per_cat[m.category] = per_cat.get(m.category, 0) + 1
+                            total += 1
+                        if out is not None:
+                            cell.comment = None
+
                 # Header-mapped column: redact the whole value (any type).
                 hc = header_cols.get(cell.column)
                 if hc and cell.row > hc[0] and cell.value is not None \
@@ -447,6 +582,23 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                 if out is not None:
                     cell.value = new_value
 
+        # Sheet headers / footers (print headers can carry names, IDs).
+        for hf in (ws.oddHeader, ws.evenHeader, ws.firstHeader,
+                   ws.oddFooter, ws.evenFooter, ws.firstFooter):
+            if hf is None:
+                continue
+            for section in (hf.left, hf.center, hf.right):
+                text = getattr(section, "text", None)
+                if not text:
+                    continue
+                h_matches = opts.run_detection(text)
+                if h_matches:
+                    for m in h_matches:
+                        per_cat[m.category] = per_cat.get(m.category, 0) + 1
+                        total += 1
+                    if out is not None:
+                        section.text = ""
+
     if out is not None:
         # Scrub workbook properties.
         try:
@@ -459,6 +611,7 @@ def _process_xlsx(src: Path, opts: ScanOptions,
         except Exception:
             pass
         wb.save(str(out))
+        _scrub_opc_app_xml(out)
     wb.close()
     return total, per_cat
 
