@@ -23,17 +23,32 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable
 
+from . import dates as _dates
+from . import ledger as _ledger
+from . import names as _names
+from . import normalize as _normalize
+from .taxonomy import CONFIRMED, LIKELY, POSSIBLE, entity_type_for
+
 # ---------------------------------------------------------------------------
 # Match result
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Match:
-    """A single detection result."""
+    """A single detection result.
+
+    ``text`` is always a slice of the original input (required for PDF
+    ``search_for``).  ``entity_type`` is the FERPA/HIPAA taxonomy key;
+    ``confidence`` is confirmed/likely/possible — lower-confidence hits
+    are still returned, never silently dropped.
+    """
     text: str
     category: str
     start: int
     end: int
+    entity_type: str = ""
+    confidence: str = CONFIRMED
+    evidence: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +298,12 @@ CATEGORIES: list[Category] = [
             _c(r"\b\d{5}(?:-\d{4})?\b"),
             # City, State
             _c(rf"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+){{0,2}},\s*(?:{_US_STATES})\b"),
-            # Apt / Suite / Unit with a number
-            _c(r"\b(?i:Apt|Apartment|Suite|Ste|Unit|Room|Rm)\.?\s*#?\s*"
+            # Apt / Suite / Unit with a number (not bare "Room 101" — too noisy)
+            _c(r"\b(?i:Apt|Apartment|Suite|Ste|Unit)\.?\s*#?\s*"
                r"[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*\b"),
+            # Place of birth (FERPA indirect identifier)
+            _c(r"\b(?i:Place\s+of\s+Birth|Birth\s+Place|Born\s+in)\s*[:\-–—]?\s*"
+               r"[A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,3}\b"),
         ],
     ),
 
@@ -318,6 +336,8 @@ CATEGORIES: list[Category] = [
         patterns=[
             _c(r"\b(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b"),
             _c(r"\(\d{3}\)\s?\d{3}-\d{4}"),
+            # OCR: O/0 confusion in a phone-shaped token.
+            _c(r"\(?[0-9O]{3}\)?[\s.\-][0-9O]{3}[\s.\-][0-9O]{4}"),
         ],
     ),
 
@@ -348,6 +368,8 @@ CATEGORIES: list[Category] = [
             _c(r"\b\d{3}-\d{2}-\d{4}\b"),
             _c(r"\b\d{3}\s\d{2}\s\d{4}\b"),
             _c(r"\b(?i:SSN)[:\s#]*\d{3}[-\s]?\d{2}[-\s]?\d{4}\b"),
+            # OCR: last digit confused with O/o
+            _c(r"\b\d{3}-\d{2}-\d{3}[Oo]\b"),
         ],
     ),
 
@@ -391,7 +413,7 @@ CATEGORIES: list[Category] = [
         label="Certificate / License Numbers",
         patterns=[
             _c(r"\b(?i:License|Lic|Cert(?:ificate)?|DL|DLN|Driver'?s?\s*Lic(?:ense)?)"
-               r"\s*(?i:No|Number|#)?[:\s]*[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*\b"),
+               r"\s*(?i:No|Number|#)?[:.\s]*[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*\b"),
         ],
         validator=_has_digit,
     ),
@@ -403,6 +425,8 @@ CATEGORIES: list[Category] = [
         patterns=[
             _c(r"\b(?i:License\s+Plate|Plate|VIN|Vehicle\s+ID)\s*(?i:No|Number|#)?"
                r"[:\s]*[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*\b"),
+            # ISO 3779 VIN (17 chars, no I/O/Q).
+            _c(r"\b[A-HJ-NPR-Z0-9]{17}\b"),
         ],
         validator=_has_digit,
     ),
@@ -436,6 +460,8 @@ CATEGORIES: list[Category] = [
         patterns=[
             _c(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
                r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b"),
+            # IPv6 (uncompressed).
+            _c(r"\b(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\b"),
         ],
     ),
 
@@ -503,9 +529,69 @@ PRESETS: dict[str, list[str]] = {
         "vehicles", "devices", "urls", "ips", "biometric", "unique_ids",
     ],
     "Full (FERPA + HIPAA)": [c.key for c in CATEGORIES],
+    "Maximum / Strict": [c.key for c in CATEGORIES],
 }
 
 # ── detection ──────────────────────────────────────────────────────────────
+
+_NAME_EVIDENCE_CONF = {
+    "honorific": CONFIRMED,
+    "honorific_ci": LIKELY,
+    "labeled": CONFIRMED,
+    "role": CONFIRMED,
+    "last_first": CONFIRMED,
+    "initial_last": LIKELY,
+    "titlecase": LIKELY,
+    "appositive": CONFIRMED,
+    "context_first": POSSIBLE,
+    "dictionary": LIKELY,
+    "ledger": LIKELY,
+}
+
+_DATE_EVIDENCE_CONF = {
+    "written_the_of": CONFIRMED,
+    "written_month_day": LIKELY,
+    "d_mon_yy": CONFIRMED,
+    "month_day_year": CONFIRMED,
+    "day_month_year": CONFIRMED,
+    "iso": CONFIRMED,
+    "numeric": CONFIRMED,
+    "md_padded": LIKELY,
+    "relative": POSSIBLE,
+    "age_over_89": CONFIRMED,
+}
+
+
+def _mk(text: str, category: str, start: int, end: int,
+        evidence: str = "", confidence: str = CONFIRMED,
+        entity_type: str = "") -> Match:
+    return Match(
+        text=text[start:end] if 0 <= start <= end <= len(text) else text[start:end],
+        category=category,
+        start=start,
+        end=end,
+        entity_type=entity_type or entity_type_for(category),
+        confidence=confidence,
+        evidence=evidence,
+    )
+
+
+def _dedupe(matches: list[Match]) -> list[Match]:
+    matches.sort(key=lambda x: (x.start, -(x.end - x.start)))
+    deduped: list[Match] = []
+    for m in matches:
+        if deduped and m.start < deduped[-1].end:
+            if (m.end - m.start) > (deduped[-1].end - deduped[-1].start):
+                deduped[-1] = m
+            continue
+        deduped.append(m)
+    deduped.sort(key=lambda x: x.start)
+    return deduped
+
+
+def _map_norm_span(index: list[int], start: int, end: int, orig_len: int) -> tuple[int, int]:
+    return _normalize.map_span(index, start, end, orig_len)
+
 
 def detect(text: str,
            enabled_categories: list[str] | None = None,
@@ -513,24 +599,109 @@ def detect(text: str,
            custom_texts: list[str] | None = None) -> list[Match]:
     """Scan *text* and return all PII/PHI matches, sorted and de-duplicated.
 
+    Pipeline:
+      PASS 0  NFKC / hyphen-join / whitespace normalize (offset-mapped)
+      PASS 1  deterministic structured-pattern detection
+      PASS 2  high-recall name + date detectors
+      PASS 3  document-level entity ledger (propagate known names)
+      PASS 4  custom literals / regex
+      PASS 5  overlap union (longest span wins)
+
     ``custom_texts`` are matched as whole words (case-insensitive) so that
     e.g. adding "Ann" does not redact inside "Anna".
+    Lower-confidence hits are returned, never dropped.
     """
     if enabled_categories is None:
         enabled_categories = list(CATEGORY_MAP)
+    enabled = set(enabled_categories)
     matches: list[Match] = []
+    orig = text
+    orig_len = len(orig)
 
+    # PASS 0 — normalized view for wrap/OCR-tolerant detectors.
+    norm, index = _normalize.build_normalized(orig)
+
+    def add_orig(start: int, end: int, category: str, evidence: str,
+                 confidence: str = CONFIRMED) -> None:
+        if start < 0 or end > orig_len or start >= end:
+            return
+        matches.append(_mk(orig, category, start, end, evidence, confidence))
+
+    def add_norm(ns: int, ne: int, category: str, evidence: str,
+                 confidence: str = CONFIRMED) -> None:
+        s, e = _map_norm_span(index, ns, ne, orig_len)
+        add_orig(s, e, category, evidence, confidence)
+
+    # PASS 1 — structured regex on original text (precise offsets).
+    skip_regex = set()
+    if "names" in enabled:
+        skip_regex.add("names")  # replaced by PASS 2
+    if "dates" in enabled:
+        skip_regex.add("dates")  # replaced by PASS 2
     for cat_key in enabled_categories:
+        if cat_key in skip_regex:
+            continue
         cat = CATEGORY_MAP.get(cat_key)
         if cat is None:
             continue
         for pat in cat.patterns:
-            for m in pat.finditer(text):
+            for m in pat.finditer(orig):
                 matched = m.group()
                 if cat.validator and not cat.validator(matched):
                     continue
-                matches.append(Match(matched, cat_key, m.start(), m.end()))
+                add_orig(m.start(), m.end(), cat_key, "regex", CONFIRMED)
 
+    # Also run structured regex on the normalized view so hyphen-wrapped
+    # emails / IDs still hit, then map back.
+    for cat_key in enabled_categories:
+        if cat_key in skip_regex:
+            continue
+        cat = CATEGORY_MAP.get(cat_key)
+        if cat is None:
+            continue
+        for pat in cat.patterns:
+            for m in pat.finditer(norm):
+                matched = m.group()
+                if cat.validator and not cat.validator(matched):
+                    continue
+                add_norm(m.start(), m.end(), cat_key, "regex_norm", CONFIRMED)
+
+    # PASS 2 — names
+    if "names" in enabled:
+        # Keep the dictionary patterns as a high-precision supplement.
+        cat = CATEGORY_MAP.get("names")
+        if cat is not None:
+            for pat in cat.patterns:
+                for m in pat.finditer(orig):
+                    add_orig(m.start(), m.end(), "names", "dictionary", LIKELY)
+        for s, e, _val, evidence in _names.detect_names(orig):
+            conf = _NAME_EVIDENCE_CONF.get(evidence, LIKELY)
+            add_orig(s, e, "names", evidence, conf)
+        for s, e, _val, evidence in _names.detect_names(norm):
+            conf = _NAME_EVIDENCE_CONF.get(evidence, LIKELY)
+            add_norm(s, e, "names", evidence + "+norm", conf)
+
+    # PASS 2 — dates
+    if "dates" in enabled:
+        for s, e, _val, evidence in _dates.detect_dates(orig):
+            conf = _DATE_EVIDENCE_CONF.get(evidence, LIKELY)
+            add_orig(s, e, "dates", evidence, conf)
+        for s, e, _val, evidence in _dates.detect_dates(norm):
+            conf = _DATE_EVIDENCE_CONF.get(evidence, LIKELY)
+            add_norm(s, e, "dates", evidence + "+norm", conf)
+
+    # PASS 3 — document-level entity ledger for names.
+    if "names" in enabled:
+        book = _ledger.EntityLedger()
+        for m in matches:
+            if m.category == "names" and (m.end - m.start) >= 3:
+                book.ingest(m.text)
+        for s, e, _val in book.extra_spans(orig):
+            add_orig(s, e, "names", "ledger", LIKELY)
+        for s, e, _val in book.extra_spans(norm):
+            add_norm(s, e, "names", "ledger+norm", LIKELY)
+
+    # PASS 4 — custom patterns / literals (always on; highest priority).
     for pattern_str in (custom_patterns or []):
         if not pattern_str.strip():
             continue
@@ -538,31 +709,19 @@ def detect(text: str,
             pat = re.compile(pattern_str, re.IGNORECASE)
         except re.error:
             continue
-        for m in pat.finditer(text):
+        for m in pat.finditer(orig):
             if m.group():
-                matches.append(Match(m.group(), "custom", m.start(), m.end()))
+                add_orig(m.start(), m.end(), "custom", "custom_regex", CONFIRMED)
 
     for literal in (custom_texts or []):
         literal = literal.strip()
         if not literal:
             continue
-        # Whole-word literal matching (case-insensitive).
         pat = re.compile(rf"\b{re.escape(literal)}\b", re.IGNORECASE)
-        for m in pat.finditer(text):
-            matches.append(Match(m.group(), "custom", m.start(), m.end()))
+        for m in pat.finditer(orig):
+            add_orig(m.start(), m.end(), "custom", "custom_literal", CONFIRMED)
 
-    # De-duplicate: keep the longest match when ranges overlap.
-    matches.sort(key=lambda x: (x.start, -(x.end - x.start)))
-    deduped: list[Match] = []
-    for m in matches:
-        if deduped and m.start < deduped[-1].end:
-            # Overlapping — keep whichever is longer.
-            if (m.end - m.start) > (deduped[-1].end - deduped[-1].start):
-                deduped[-1] = m
-            continue
-        deduped.append(m)
-    deduped.sort(key=lambda x: x.start)
-    return deduped
+    return _dedupe(matches)
 
 
 def detect_summary(text: str,

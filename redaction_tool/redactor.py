@@ -51,6 +51,9 @@ class RedactResult:
     redaction_count: int = 0
     per_category: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+    # Fail-closed recoverability: PASS, NEEDS_REVIEW, or None if not run.
+    recoverability: str | None = None
+    recoverability_leaked: int = 0
 
 
 @dataclass
@@ -771,6 +774,25 @@ def redact_file(src_path: str | Path,
         result.redaction_count = count
         result.per_category = per_cat
         result.outputs.append(out_path)
+
+        # Fail-closed recoverability: re-extract every reachable representation
+        # and confirm targeted values of length >= 4 are gone.  Does not log
+        # the values themselves.
+        try:
+            from . import verify as _verify
+            needles: list[str] = []
+            for unit in iter_text_units(src):
+                for m in opts.run_detection(unit):
+                    if len(m.text) >= 4:
+                        needles.append(m.text)
+            if needles:
+                report = _verify.verify_export(out_path, needles)
+                result.recoverability = report["status"]
+                result.recoverability_leaked = int(report.get("leaked_count") or 0)
+                if report["status"] == "ERROR":
+                    result.error = report.get("reason") or "recoverability check failed"
+        except Exception:
+            result.recoverability = "NEEDS_REVIEW"
 
         if image_output and ext == ".pdf":
             img_dir = (Path(out_dir) / f"{out_path.stem}_images") if out_dir \

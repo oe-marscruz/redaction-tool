@@ -26,7 +26,12 @@ jobs:
           python -m py_compile redaction_tool/*.py run.py validate_real_files.py
 
       - name: Unit + regression tests
-        run: python tests/test_core.py
+        run: |
+          python tests/test_core.py
+          python tests/test_high_recall.py
+
+      - name: Synthetic evaluation corpus
+        run: python tests/eval_metrics.py
 
       - name: Headless self-test
         run: python run.py --selftest result.txt

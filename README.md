@@ -42,6 +42,8 @@ manually; the tool leaves embedded images intact.
 - **FERPA Only** — student-focused categories.
 - **HIPAA Only** — all 18 identifier categories.
 - **Full (FERPA + HIPAA)** — everything.
+- **Maximum / Strict** — every category, recall-first (highest false-positive
+  tolerance, for cases where missing an identifier is worse than over-redacting).
 - **Custom** — use *Customize / Save Preset…* to toggle categories and save
   your own profiles (stored in `%USERPROFILE%\.redaction_tool\presets`).
 
@@ -125,10 +127,15 @@ python run.py --selftest result.txt
    columns and inline date *strings* are redacted. If your compliance review
    requires all dates removed, redact those columns manually or request a
    custom build.
-3. Name detection is tuned to avoid redacting common English words (months,
-   verbs). Standalone first names are caught only when capitalized and
-   unambiguous — surnames alone ("Drollinger") and uncommon first names need
-   the **Extra literal texts** box. Always add each case subject's full name
+3. Name detection now combines deterministic patterns (honorifics, "Last,
+   First", initials, labeled roles) with **document-level entity memory**:
+   once a name is seen, later variants ("Ms. Montoya", "A. Montoya",
+   "Montoya") are flagged too. Unlabeled narrative names are caught via
+   context, and OCR-corrupted spellings (J0hn, Mar-\ngaret) are handled by a
+   normalization pass. Ambiguous tokens (May, Jordan, Brown) are only
+   redacted when person-context or a prior mention supports it — they are
+   not blind redactions. The **Extra literal texts** box remains the most
+   reliable catch for known subjects; add every case subject's full name
    there.
 4. Scanned/image-only PDFs have no text layer — detection finds nothing
    without OCR.  Enable the **OCR checkbox** to process these (requires
@@ -169,6 +176,12 @@ low-confidence results surfaced as warnings.
   re-scanned and reported as `PASS` (zero residual detections) or
   `NEEDS_REVIEW`. A standalone **Verify Last Batch** button re-runs this
   on demand.
+- **Recoverability check (fail-closed)**: after export, the tool re-extracts
+  every reachable representation — PDF text layer *and raw content streams*,
+  link URIs, embedded files, form fields, DOCX/XLSX XML including footnotes,
+  text boxes, comments, and app.xml — and confirms targeted identifiers
+  cannot be recovered. If any survive, the result is marked `NEEDS_REVIEW`,
+  never `PASS`. A missing/empty output is treated as an error.
 - **Audit log**: each batch writes `redaction_log_<timestamp>.json` next
   to the outputs — source file, preset, per-category counts, verify
   result, and timestamp for every entry.
@@ -202,7 +215,13 @@ works fully offline without it.
 ## Project layout
 
 - `redaction_tool/ocr.py` — OCR engine (scan → plan → apply → verify)
-- `redaction_tool/detector.py` — PII/PHI patterns, built-in presets, `detect()`
+- `redaction_tool/detector.py` — PII/PHI patterns, built-in presets, multi-pass `detect()`
+- `redaction_tool/names.py` — high-recall name detection (honorifics, labels, compound surnames, initials)
+- `redaction_tool/dates.py` — high-recall date/age detection (numeric, written, relative)
+- `redaction_tool/ledger.py` — document-level entity memory (name-variant propagation)
+- `redaction_tool/normalize.py` — NFKC / hyphen-join / OCR-tolerant normalization with offset mapping
+- `redaction_tool/taxonomy.py` — canonical FERPA/HIPAA entity taxonomy + coverage map
+- `redaction_tool/verify.py` — post-export recoverability (fail-closed)
 - `redaction_tool/redactor.py` — per-format redaction engines + image output
 - `redaction_tool/presets.py` — custom preset save/load/delete (JSON)
 - `redaction_tool/gui.py` — Tkinter desktop app (drag & drop via tkinterdnd2)
@@ -210,10 +229,11 @@ works fully offline without it.
 - `references/` — methodology, plan schema, entity policy docs
 - `templates/`, `examples/` — sample redaction plan files
 - `SKILL.md` — Hermes/Bionic AI agent skill definition
-- `tests/` — unit tests + dependency checker
+- `tests/` — unit tests, high-recall tests, synthetic eval corpus + metrics
 - `RedactionTool.spec` — PyInstaller one-file build config
 - `Run-RedactionTool.bat` — double-click launcher (exe, or auto-installs
   deps and runs from source)
 - `validate_real_files.py` — regression harness: redacts copies of real case
   files into a temp folder and verifies subject identifiers don't leak
-- `.github/workflows/ci.yml` — CI: syntax check, unit tests, self-test
+- `.github/workflows/ci.yml` — CI: syntax check, unit tests, high-recall
+  tests, synthetic evaluation, self-test

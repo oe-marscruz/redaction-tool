@@ -842,6 +842,12 @@ class App:
             entry["outputs"] = [str(o) for o in result.outputs]
             entry["redaction_count"] = result.redaction_count
             entry["per_category"] = result.per_category
+            if result.recoverability:
+                entry["recoverability"] = result.recoverability
+                entry["recoverability_leaked"] = result.recoverability_leaked
+                if result.recoverability != "PASS":
+                    lines.append(f"    RECOVERABILITY: {result.recoverability} "
+                                 f"(leaked={result.recoverability_leaked})")
 
             # If OCR enabled, apply OCR redactions on top of the text pass.
             if use_ocr and ext == ".pdf":
