@@ -76,3 +76,52 @@ if ((Get-Content (Join-Path $root "exe_selftest.txt") -Raw) -notmatch "PASS bund
 }
 Get-Content exe_selftest.txt
 Write-Host "Built dist\RedactionTool.exe"
+
+# --- Optional: Inno Setup installer -------------------------------------
+# The exe above is the primary artifact. If Inno Setup 6 is installed, also
+# compile installer\RedactionTool.iss; otherwise warn and finish successfully.
+function Find-Iscc {
+    $candidates = @()
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($base) { $candidates += (Join-Path $base "Inno Setup 6\ISCC.exe") }
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    $onPath = Get-Command iscc -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+
+$packageVersion = & $venvPython -c `
+    "import sys; sys.path.insert(0, sys.argv[1]); import version_file; print(version_file.read_package_version())" `
+    (Join-Path $root "scripts")
+if ($LASTEXITCODE -ne 0 -or -not $packageVersion) {
+    throw "Could not read the package version from redaction_tool/__init__.py."
+}
+$packageVersion = ("$packageVersion").Trim()
+
+$iscc = Find-Iscc
+if (-not $iscc) {
+    Write-Warning @"
+Inno Setup 6 (ISCC.exe) was not found, so no installer was built.
+dist\RedactionTool.exe above is still complete and usable.
+To also produce installer\Output\RedactionTool-Setup-$packageVersion.exe:
+  winget install --id JRSoftware.InnoSetup -e
+then re-run .\build_windows.ps1 (or compile installer\RedactionTool.iss directly).
+"@
+} else {
+    Write-Host "Compiling installer with $iscc (version $packageVersion)"
+    & $iscc "/DAppVersion=$packageVersion" (Join-Path $root "installer\RedactionTool.iss")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inno Setup compilation failed with exit code $LASTEXITCODE."
+    }
+    $setupPath = Join-Path $root "installer\Output\RedactionTool-Setup-$packageVersion.exe"
+    if (-not (Test-Path -LiteralPath $setupPath)) {
+        throw "Installer compiled but expected output was not created: $setupPath"
+    }
+    Write-Host "Built $setupPath"
+}
