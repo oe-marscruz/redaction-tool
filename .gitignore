@@ -17,8 +17,12 @@ __pycache__/
 # Temp / test output files
 selftest_result.txt
 exe_selftest.txt
+exe_selftest_abs.txt
 *.tmp
 tests/eval_last.json
+
+# Locally staged third-party build assets (do not commit binaries/models).
+vendor/
 
 # IDE / editor
 .vscode/

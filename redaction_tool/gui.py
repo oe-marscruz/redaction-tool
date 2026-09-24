@@ -344,10 +344,12 @@ class App:
         ocr_row = tk.Frame(out_frame, bg=t["bg"])
         ocr_row.pack(fill="x", pady=(8, 0))
         self.ocr_enabled_var = tk.BooleanVar(value=False)
-        tesseract_found = ocr.find_tesseract() is not None
+        ocr_dependencies = ocr.check_dependencies()
+        tesseract_found = (ocr_dependencies["tesseract"]
+                           and ocr_dependencies["eng_traineddata"])
         ocr_text = "Enable OCR (scanned/image-only documents)"
         if not tesseract_found:
-            ocr_text += " — Tesseract not found"
+            ocr_text += " — Tesseract or English OCR data not found"
         self.ocr_cb = tk.Checkbutton(ocr_row, text=ocr_text,
                                       variable=self.ocr_enabled_var,
                                       font=("Segoe UI", 10),
@@ -358,14 +360,22 @@ class App:
         self.ocr_cb.pack(side="left")
         if not tesseract_found:
             self.ocr_cb.configure(state="disabled")
-        self.presidio_var = tk.BooleanVar(value=False)
+        presidio_available = detector.presidio_is_available()
+        self.presidio_var = tk.BooleanVar(value=presidio_available)
+        presidio_text = (
+            "Presidio NER (local, all document types)"
+            if presidio_available else
+            "Presidio NER unavailable (missing bundled model)"
+        )
         self.presidio_cb = tk.Checkbutton(
-            ocr_row, text="Presidio NER (if installed)",
+            ocr_row, text=presidio_text,
             variable=self.presidio_var, font=("Segoe UI", 9),
             bg=t["bg"], fg=t["muted"], activebackground=t["bg"],
             activeforeground=t["fg"], selectcolor=t["surface"])
         self.presidio_cb._theme_role = "muted"
         self.presidio_cb.pack(side="left", padx=(12, 0))
+        if not presidio_available:
+            self.presidio_cb.configure(state="disabled")
 
         img_row = tk.Frame(out_frame, bg=t["bg"])
         img_row.pack(fill="x", pady=(4, 0))

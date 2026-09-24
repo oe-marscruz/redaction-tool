@@ -99,11 +99,19 @@ pip install -r requirements.txt
 python run.py
 ```
 
+To build the fully bundled one-file Windows `.exe`, use the staged Tesseract
+runtime under `vendor\tesseract` and follow [BUILDING.md](BUILDING.md).
+`tesseract-main.zip` contains source code only; the build never launches a
+Tesseract installer. The script installs the pinned local Presidio analyzer and
+English spaCy model and bundles Tesseract's English OCR trained data. The
+resulting `.exe` can run offline without Python or Tesseract installed
+separately.
+
 To build your own exe after making changes:
 
 ```bash
-pip install pyinstaller
-pyinstaller --noconfirm RedactionTool.spec
+Set-ExecutionPolicy -Scope Process Bypass
+.\build_windows.ps1
 ```
 
 > Note: single-file exe builds are occasionally flagged by antivirus
@@ -146,7 +154,8 @@ python run.py --selftest result.txt
 
 ## OCR support (scanned & image-only documents)
 
-When **Enable OCR** is checked (requires a local Tesseract installation),
+When **Enable OCR** is checked (the packaged Windows release includes local
+Tesseract and English data; running from source requires a local installation),
 the tool renders PDF pages to images, runs OCR with word-level bounding
 boxes, and applies redactions using the same 19-category detection
 pipeline. This covers:
@@ -159,9 +168,9 @@ pipeline. This covers:
 
 To use it:
 
-1. [Install Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
-   (free, offline).  Make sure `tesseract.exe` is on your PATH or set the
-   `TESSERACT_CMD` environment variable.
+1. For source runs, install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
+   and English trained data; make sure `tesseract.exe` is on your PATH or set
+   the `TESSERACT_CMD` environment variable. The release `.exe` bundles these.
 2. Tick **Enable OCR** in the output options.
 3. Scan and redact as usual — OCR detections are merged with text-based
    results. Image-only files are handled exclusively via OCR.
@@ -207,10 +216,13 @@ Beyond visible text, the tool also scrubs:
 | `docProps/app.xml` Manager/Company | DOCX, XLSX | Blanket-cleared |
 | Document metadata (author, etc.) | All | Blanket-cleared |
 
-Optional **Presidio NER** (Microsoft, local in-process) can supplement
-name detection in OCR pipelines: `pip install -r requirements-presidio-optional.txt`
-then tick *Presidio NER*. The tool never starts a Presidio server and
-works fully offline without it.
+**Presidio NER** (Microsoft, local in-process) supplements name and location
+detection for native PDF, DOCX, XLSX, and OCR text. It is enabled by default
+when installed and can be unchecked in the UI. Install it for source runs with
+`pip install -r requirements-presidio-optional.txt`; the Windows release build
+bundles Presidio and its English model. The tool never starts a Presidio server.
+The statistical model can produce false positives and false negatives; review
+detections before redacting.
 
 ## Project layout
 
