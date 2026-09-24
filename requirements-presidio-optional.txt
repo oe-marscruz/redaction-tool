@@ -1,1 +1,4 @@
-presidio-analyzer>=2.2
+# Presidio uses spaCy 3.x and this model was trained for spaCy 3.8.
+presidio-analyzer==2.2.364
+spacy==3.8.11
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85

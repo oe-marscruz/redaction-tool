@@ -13,19 +13,15 @@ Based on ocr-redaction-local v1.0.0 methodology (see references/methodology.md).
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
-from . import detector
 
 # ── Dependencies ───────────────────────────────────────────────────────────
 
@@ -51,6 +47,15 @@ PDF_EXTS = {".pdf"}
 
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
+
+def _resource_path(*parts: str) -> Path:
+    """Resolve bundled assets in a PyInstaller build or source checkout."""
+    if hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).resolve().parents[1] / "vendor"
+    return base.joinpath(*parts)
+
 # ── Tesseract ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -66,9 +71,10 @@ class OCRWord:
 
 
 def find_tesseract() -> Optional[str]:
-    """Return the path to a working Tesseract executable, or None."""
+    """Prefer the bundled OCR executable, then support local dev installs."""
     import shutil
     candidates = [
+        str(_resource_path("tesseract", "tesseract.exe")),
         os.environ.get("TESSERACT_CMD", ""),
         DEFAULT_TESSERACT,
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -87,10 +93,38 @@ def find_tesseract() -> Optional[str]:
     return None
 
 
+def find_tessdata(tesseract_cmd: Optional[str] = None) -> Optional[Path]:
+    """Find the English trained-data folder bundled with the executable."""
+    if tesseract_cmd:
+        executable = tesseract_cmd
+    elif hasattr(sys, "_MEIPASS"):
+        executable = str(_resource_path("tesseract", "tesseract.exe"))
+    else:
+        executable = find_tesseract()
+    bundled_data = _resource_path("tesseract", "tessdata")
+    candidates = [
+        bundled_data,
+        _resource_path("tesseract"),
+        Path(os.environ.get("TESSDATA_PREFIX", "")) if os.environ.get("TESSDATA_PREFIX") else None,
+    ]
+    if executable:
+        candidates.append(Path(executable).parent / "tessdata")
+    candidates.extend((
+        Path(r"C:\Program Files\Tesseract-OCR\tessdata"),
+        Path(r"C:\Program Files (x86)\Tesseract-OCR\tessdata"),
+    ))
+    for candidate in candidates:
+        if (candidate and (candidate / "eng.traineddata").is_file()
+                and (candidate / "configs" / "tsv").is_file()):
+            return candidate
+    return None
+
+
 def check_dependencies() -> dict:
     """Return a status dict of what's available for OCR workflows."""
     return {
         "tesseract": bool(find_tesseract()),
+        "eng_traineddata": bool(find_tessdata()),
         "pymupdf": True,   # already required by the main tool
         "pillow": _PILLOW_OK,
     }
@@ -110,12 +144,30 @@ def run_ocr(image_path: Path, lang: str = "eng",
             "https://github.com/UB-Mannheim/tesseract/wiki and ensure "
             "tesseract.exe is on your PATH or set TESSERACT_CMD."
         )
+    tessdata = find_tessdata(tesseract_cmd)
+    if not tessdata:
+        raise RuntimeError(
+            "Tesseract English data (eng.traineddata) was not found. "
+            "The packaged app should include it under tesseract/tessdata."
+        )
     proc = subprocess.run(
-        [cmd, str(image_path), "stdout", "-l", lang, "tsv"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
+        [cmd, str(image_path), "stdout", "--tessdata-dir", str(tessdata),
+         "-l", lang, "tsv"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", timeout=120,
     )
-    if proc.returncode != 0 and not proc.stdout.strip():
-        raise RuntimeError(f"Tesseract failed: {proc.stderr.strip()}")
+    if proc.returncode != 0:
+        # Tesseract expects --tessdata-dir to be the parent of tessdata; older
+        # and some Windows builds instead expect the tessdata folder itself.
+        if "Error opening data file" in proc.stderr:
+            proc = subprocess.run(
+                [cmd, str(image_path), "stdout", "--tessdata-dir", str(tessdata.parent),
+                 "-l", lang, "tsv"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120,
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Tesseract failed: {proc.stderr.strip()}")
 
     rows = csv.DictReader(io.StringIO(proc.stdout), delimiter="\t")
     words: list[OCRWord] = []
@@ -170,45 +222,6 @@ def span_bbox(words: list[OCRWord], start: int, end: int,
 
 # ── Detection (integrated with our full detector) ──────────────────────────
 
-# Optional Presidio entity types → our category keys.
-_PRESIDIO_CATEGORY_MAP = {
-    "PERSON": "names",
-    "LOCATION": "addresses",
-    "ORGANIZATION": "names",
-    "EMAIL_ADDRESS": "emails",
-    "PHONE_NUMBER": "phones",
-    "US_SSN": "ssn",
-    "IP_ADDRESS": "ips",
-    "URL": "urls",
-    "DATE_TIME": "dates",
-}
-
-
-def _presidio_spans(text: str) -> tuple[list[tuple[int, int, str, str, float]], list[str]]:
-    """Run optional local Presidio NER.  Returns (spans, warnings).
-
-    Never imports or starts any server — presidio-analyzer runs in-process.
-    """
-    warnings: list[str] = []
-    try:
-        from presidio_analyzer import AnalyzerEngine
-    except ImportError:
-        return [], ["Presidio requested but presidio-analyzer is not installed "
-                    "— NER skipped."]
-    try:
-        analyzer = getattr(_presidio_spans, "_engine", None)
-        if analyzer is None:
-            analyzer = AnalyzerEngine()
-            _presidio_spans._engine = analyzer  # cache across pages
-        spans: list[tuple[int, int, str, str, float]] = []
-        for res in analyzer.analyze(text=text, language="en"):
-            spans.append((res.start, res.end, res.entity_type,
-                          text[res.start:res.end], float(res.score)))
-        return spans, warnings
-    except Exception as exc:  # noqa: BLE001
-        return [], [f"Presidio analysis failed: {exc}"]
-
-
 def detect_on_ocr(words: list[OCRWord],
                   scan_opts: Optional["redactor_ScanOptions"] = None,
                   ) -> tuple[list[dict], list[str]]:
@@ -226,20 +239,6 @@ def detect_on_ocr(words: list[OCRWord],
     text = ocr_text(words)
     matches = opts.run_detection(text)  # uses our full detector.py
     warnings: list[str] = []
-
-    # Optional local Presidio NER (covers names the built-in list misses).
-    if getattr(opts, "use_presidio", False):
-        spans, pres_warnings = _presidio_spans(text)
-        warnings.extend(pres_warnings)
-        for start, end, entity_type, value, score in spans:
-            matches.append(detector.Match(
-                text=value,
-                category=_PRESIDIO_CATEGORY_MAP.get(entity_type, "custom"),
-                start=start,
-                end=end,
-            ))
-        # Re-deduplicate after merging.
-        matches = _dedupe_matches(matches)
 
     salt = getattr(opts, "hash_salt", "") or ""
 
@@ -259,11 +258,13 @@ def detect_on_ocr(words: list[OCRWord],
             "id": f"ocr-{idx:05d}",
             "page": 1,  # will be overridden by caller for multi-page PDFs
             "entity_type": m.category,
-            "source": "ocr+detector",
+            "source": "ocr+" + m.evidence if m.evidence.startswith("presidio:") else "ocr+detector",
             "bbox": [round(float(x), 3) for x in (left, top, right, bottom)],
             "coordinate_space": "image_pixels",  # converted to pdf_points by caller
             "ocr_confidence": round(float(conf), 2) if conf >= 0 else None,
-            "detector_confidence": 1.0,
+            "detector_confidence": {
+                "confirmed": 1.0, "likely": 0.85, "possible": 0.6,
+            }.get(m.confidence, 1.0),
             "preview": _mask_value(m.category, m.text),
             "sha256": hashlib.sha256((salt + m.text).encode("utf-8")).hexdigest(),
             "action": "redact",

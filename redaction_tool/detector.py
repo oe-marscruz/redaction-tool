@@ -20,7 +20,11 @@ Name detection combines:
 from __future__ import annotations
 
 import re
+import threading
+import sys
+from importlib.util import find_spec
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from . import dates as _dates
@@ -581,6 +585,17 @@ def _dedupe(matches: list[Match]) -> list[Match]:
     deduped: list[Match] = []
     for m in matches:
         if deduped and m.start < deduped[-1].end:
+            previous = deduped[-1]
+            if m.start == previous.start and m.end == previous.end:
+                confidence_rank = {POSSIBLE: 0, LIKELY: 1, CONFIRMED: 2}
+                previous.confidence = max(
+                    (previous.confidence, m.confidence),
+                    key=lambda value: confidence_rank.get(value, 0),
+                )
+                if m.evidence and m.evidence not in previous.evidence:
+                    previous.evidence = "+".join(
+                        part for part in (previous.evidence, m.evidence) if part)
+                continue
             if (m.end - m.start) > (deduped[-1].end - deduped[-1].start):
                 deduped[-1] = m
             continue
@@ -593,10 +608,131 @@ def _map_norm_span(index: list[int], start: int, end: int, orig_len: int) -> tup
     return _normalize.map_span(index, start, end, orig_len)
 
 
+# Presidio is an optional in-process supplement. Explicitly configure the
+# small English model rather than relying on Presidio's larger default model.
+_PRESIDIO_ENTITY_MAP = {
+    "PERSON": "names",
+    "LOCATION": "addresses",
+}
+_presidio_lock = threading.Lock()
+_presidio_engine = None
+_offline_tldextract_configured = False
+
+
+def _presidio_model_path() -> Path | None:
+    """Return the local model directory, including PyInstaller's staged data."""
+    if hasattr(sys, "_MEIPASS"):
+        model_path = Path(sys._MEIPASS) / "en_core_web_sm" / "en_core_web_sm-3.8.0"
+    else:
+        try:
+            import en_core_web_sm
+        except ImportError:
+            return None
+        model_path = Path(en_core_web_sm.__file__).parent / "en_core_web_sm-3.8.0"
+    if (model_path / "config.cfg").is_file() and (model_path / "meta.json").is_file():
+        return model_path
+    return None
+
+
+def presidio_is_available() -> bool:
+    """Whether the analyzer and its explicitly configured model can import."""
+    return (
+        find_spec("presidio_analyzer") is not None
+        and find_spec("spacy") is not None
+        and _presidio_model_path() is not None
+    )
+
+
+def get_presidio_engine():
+    """Return the cached local Presidio analyzer; never downloads a model."""
+    global _presidio_engine, _offline_tldextract_configured
+    if _presidio_engine is not None:
+        return _presidio_engine
+    with _presidio_lock:
+        if _presidio_engine is not None:
+            return _presidio_engine
+        try:
+            from presidio_analyzer import AnalyzerEngine
+            from presidio_analyzer.nlp_engine import NlpEngineProvider
+            import tldextract
+
+            # Presidio's default email recognizer calls tldextract.extract,
+            # which otherwise tries public-suffix HTTP URLs on first use.
+            if not _offline_tldextract_configured:
+                tldextract.tldextract.TLD_EXTRACTOR = tldextract.TLDExtract(
+                    cache_dir=None, suffix_list_urls=(), fallback_to_snapshot=True)
+                _offline_tldextract_configured = True
+
+            provider = NlpEngineProvider(nlp_configuration={
+                "nlp_engine_name": "spacy",
+                "models": [{
+                    "lang_code": "en",
+                    # Explicit local path avoids Presidio trying to fetch a
+                    # missing model when the app is offline.
+                    "model_name": str(_presidio_model_path()),
+                }],
+            })
+            nlp_engine = provider.create_engine()
+            from presidio_analyzer.recognizer_registry import RecognizerRegistry
+            from presidio_analyzer.predefined_recognizers import SpacyRecognizer
+
+            registry = RecognizerRegistry(
+                recognizers=[SpacyRecognizer(supported_language="en")],
+                supported_languages=["en"],
+            )
+            _presidio_engine = AnalyzerEngine(
+                registry=registry,
+                nlp_engine=nlp_engine,
+                supported_languages=["en"],
+                default_score_threshold=0.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — do not silently disable requested PII detection
+            raise RuntimeError(
+                "Presidio was enabled but could not initialize its bundled English "
+                "model. Install the pinned dependencies from "
+                "requirements-presidio-optional.txt and ensure en_core_web_sm is "
+                "available."
+            ) from exc
+    return _presidio_engine
+
+
+def _presidio_matches(text: str, enabled: set[str]) -> list[Match]:
+    """Map local Presidio results to enabled detector categories."""
+    # Prebuilt recognizers often produce duplicates of the deterministic
+    # detector. Presidio's supplement here is the NER layer only.
+    entity_types = sorted(
+        entity for entity, category in _PRESIDIO_ENTITY_MAP.items()
+        if category in enabled
+    )
+    if not entity_types or not text:
+        return []
+    try:
+        results = get_presidio_engine().analyze(
+            text=text, entities=entity_types, language="en")
+    except Exception as exc:  # noqa: BLE001 — requested analysis must not fail open
+        raise RuntimeError(f"Presidio analysis failed: {exc}") from exc
+
+    matches: list[Match] = []
+    for result in results:
+        category = _PRESIDIO_ENTITY_MAP.get(result.entity_type)
+        if category not in enabled:
+            continue
+        start, end = int(result.start), int(result.end)
+        if start < 0 or end > len(text) or start >= end:
+            continue
+        score = float(result.score)
+        confidence = CONFIRMED if score >= 0.85 else LIKELY if score >= 0.65 else POSSIBLE
+        matches.append(_mk(text, category, start, end,
+                           f"presidio:{result.entity_type}:{score:.2f}",
+                           confidence))
+    return matches
+
+
 def detect(text: str,
            enabled_categories: list[str] | None = None,
            custom_patterns: list[str] | None = None,
-           custom_texts: list[str] | None = None) -> list[Match]:
+           custom_texts: list[str] | None = None,
+           use_presidio: bool = False) -> list[Match]:
     """Scan *text* and return all PII/PHI matches, sorted and de-duplicated.
 
     Pipeline:
@@ -605,7 +741,8 @@ def detect(text: str,
       PASS 2  high-recall name + date detectors
       PASS 3  document-level entity ledger (propagate known names)
       PASS 4  custom literals / regex
-      PASS 5  overlap union (longest span wins)
+      PASS 5  optional local Presidio NLP (mapped to enabled categories)
+      PASS 6  overlap union (longest span wins)
 
     ``custom_texts`` are matched as whole words (case-insensitive) so that
     e.g. adding "Ann" does not redact inside "Anna".
@@ -721,15 +858,22 @@ def detect(text: str,
         for m in pat.finditer(orig):
             add_orig(m.start(), m.end(), "custom", "custom_literal", CONFIRMED)
 
+    # Optional local NLP supplement. Presidio spans are constrained to the
+    # active profile so an entity disabled in the GUI cannot be redacted.
+    if use_presidio:
+        matches.extend(_presidio_matches(orig, enabled))
+
     return _dedupe(matches)
 
 
 def detect_summary(text: str,
                    enabled_categories: list[str] | None = None,
                    custom_patterns: list[str] | None = None,
-                   custom_texts: list[str] | None = None) -> dict[str, int]:
+                   custom_texts: list[str] | None = None,
+                   use_presidio: bool = False) -> dict[str, int]:
     """Return a count of detected items per category."""
     summary: dict[str, int] = {}
-    for m in detect(text, enabled_categories, custom_patterns, custom_texts):
+    for m in detect(text, enabled_categories, custom_patterns, custom_texts,
+                    use_presidio=use_presidio):
         summary[m.category] = summary.get(m.category, 0) + 1
     return summary

@@ -67,13 +67,13 @@ class ScanOptions:
     # short values (SSNs) are brute-forceable, so every batch gets a random
     # salt that is stored alongside the plan.
     hash_salt: str = ""
-    # Optional local Presidio NER (only used by the OCR pipeline; silently
-    # skipped when presidio-analyzer is not installed).
+    # Optional local Presidio NER supplement for text and OCR pipelines.
     use_presidio: bool = False
 
     def run_detection(self, text: str) -> list[Match]:
         return detect(text, self.enabled_categories,
-                      self.custom_patterns, self.custom_texts)
+                      self.custom_patterns, self.custom_texts,
+                      use_presidio=self.use_presidio)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
