@@ -4,6 +4,7 @@ Run:  python tests/test_core.py        (no pytest needed)
 """
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -31,6 +32,89 @@ def test_custom_text_whole_word():
     matches = detector.detect("Ann met Anna", custom_texts=["Ann"])
     texts = [m.text for m in matches]
     assert texts.count("Ann") == 1  # "Anna" must not match
+
+
+def test_presidio_name_supplement_and_profile_filter():
+    text = "The report mentions Zyrphonia."
+    start = text.index("Zyrphonia")
+
+    class FakeAnalyzer:
+        def __init__(self):
+            self.calls = []
+
+        def analyze(self, *, text, entities, language):
+            self.calls.append((entities, language))
+            if "PERSON" not in entities:
+                return []
+            return [SimpleNamespace(start=start, end=start + len("Zyrphonia"),
+                                    entity_type="PERSON", score=0.91)]
+
+    fake = FakeAnalyzer()
+    original = detector.get_presidio_engine
+    detector.get_presidio_engine = lambda: fake
+    try:
+        names = detector.detect(text, enabled_categories=["names"],
+                                use_presidio=True)
+        assert any(m.text == "Zyrphonia" and m.category == "names"
+                   for m in names), names
+        before = len(fake.calls)
+        addresses = detector.detect(text, enabled_categories=["addresses"],
+                                    use_presidio=True)
+        assert not any(m.text == "Zyrphonia" for m in addresses), addresses
+        assert len(fake.calls) == before + 1
+        assert fake.calls[-1][0] == ["LOCATION"]
+    finally:
+        detector.get_presidio_engine = original
+
+
+def test_presidio_actual_name_and_location_detection_offline():
+    if not detector.presidio_is_available():
+        print("SKIP: Presidio extras not installed")
+        return
+    text = "Patient Alice Johnson was seen in Boston."
+    matches = detector.detect(text, enabled_categories=["names", "addresses"],
+                              use_presidio=True)
+    assert any(m.category == "names" and "Alice Johnson" in m.text for m in matches), matches
+    assert any(m.category == "addresses" and "Boston" in m.text for m in matches), matches
+
+
+def test_presidio_is_used_for_ocr_text_units():
+    text = "Zyrphonia"
+    fake_result = SimpleNamespace(start=0, end=len(text), entity_type="PERSON", score=0.9)
+
+    class FakeAnalyzer:
+        def analyze(self, **kwargs):
+            return [fake_result]
+
+    original = detector.get_presidio_engine
+    detector.get_presidio_engine = lambda: FakeAnalyzer()
+    try:
+        opts = redactor.ScanOptions(enabled_categories=["names"], use_presidio=True)
+        words = [ocr.OCRWord(text, 10, 10, 120, 25, 95.0, start=0, end=len(text))]
+        entries, warnings = ocr.detect_on_ocr(words, scan_opts=opts)
+        assert not warnings
+        assert any(entry["entity_type"] == "names" for entry in entries), entries
+    finally:
+        detector.get_presidio_engine = original
+
+
+def test_presidio_fails_closed_when_analysis_errors():
+    class BrokenAnalyzer:
+        def analyze(self, **kwargs):
+            raise ValueError("mock analyzer error")
+
+    original = detector.get_presidio_engine
+    detector.get_presidio_engine = lambda: BrokenAnalyzer()
+    try:
+        try:
+            detector.detect("A clean sentence.", enabled_categories=["names"],
+                            use_presidio=True)
+        except RuntimeError as exc:
+            assert "Presidio analysis failed" in str(exc)
+        else:
+            raise AssertionError("Presidio analysis failure was silently ignored")
+    finally:
+        detector.get_presidio_engine = original
 
 
 def test_mask_value_never_full_ssn():
