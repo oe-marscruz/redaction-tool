@@ -23,8 +23,9 @@ jobs:
           pip install -r requirements-presidio-optional.txt
 
       - name: Syntax check
+        # PowerShell does not expand shell globs, so let Python do it.
         run: |
-          python -m py_compile redaction_tool/*.py run.py validate_real_files.py
+          python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py')]]"
 
       - name: Unit + regression tests
         run: |
