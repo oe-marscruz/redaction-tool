@@ -1,10 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Single-file Windows bundle. Run build_windows.ps1 to validate asset inputs."""
 
+import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH)
+
+# Windows version resource for the exe, generated from
+# redaction_tool/__init__.py.__version__ (the single source of truth).
+sys.path.insert(0, str(ROOT / "scripts"))
+from version_file import generate as generate_version_file  # noqa: E402
+
+version_file = str(generate_version_file())
+
 TESSERACT = ROOT / "vendor" / "tesseract"
 MODEL = ROOT / "vendor" / "en_core_web_sm"
 TESSERACT_RUNTIME_DLLS = list(TESSERACT.rglob("*.dll"))
@@ -103,6 +112,7 @@ exe = EXE(
     a.datas,
     [],
     name="RedactionTool",
+    version=version_file,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
