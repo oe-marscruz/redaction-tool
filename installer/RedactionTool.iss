@@ -49,8 +49,11 @@ SolidCompression=yes
 WizardStyle=modern
 
 ; SetupIconFile intentionally omitted: no .ico asset ships in the repo.
-; CloseApplications left at its default - layer 3 owns running-instance
-; handling.
+
+; Belt-and-braces companion to the [Code] running-instance handling: if the
+; Restart Manager reports our exe in use during the file-copy phase, ask to
+; close it (non-silent) instead of failing outright.
+CloseApplications=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
@@ -74,8 +77,10 @@ Filename: "{app}\RedactionTool.exe"; \
   Flags: nowait postinstall skipifsilent
 
 ; ---------------------------------------------------------------------------
-; [Code]
-; Intentionally empty in this layer. Layer 3 hooks in here: old-version
-; detection, running-process blocking, portable-copy cleanup, and data
-; preservation in %USERPROFILE%\.redaction_tool.
+; [Code] lives in Code.iss, included below: layer 3 -- old-version detection
+; & removal, running-instance handling, portable-copy cleanup, and the
+; (intentional) guarantee that %USERPROFILE%\.redaction_tool user data is
+; never deleted on upgrade or uninstall. See that file's header.
 ; ---------------------------------------------------------------------------
+
+#include "Code.iss"
