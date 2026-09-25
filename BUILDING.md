@@ -62,6 +62,58 @@ PyInstaller extracts its bundled files to a temporary directory at launch.
 Test the resulting executable on a clean machine without Python, Tesseract,
 or network access before distributing it.
 
+## Installer (Inno Setup)
+
+`build_windows.ps1` also compiles a per-user installer after the exe
+self-test, **if Inno Setup 6 is installed**; otherwise it prints a warning
+with install instructions and finishes successfully (the exe is the primary
+artifact). Find it with:
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
+```
+
+The script locates `ISCC.exe` in `Program Files`, `Program Files (x86)`, and
+`%LOCALAPPDATA%\Programs\Inno Setup 6`, then falls back to `iscc` on `PATH`.
+To compile by hand:
+
+```powershell
+ISCC /DAppVersion=1.2.0 installer\RedactionTool.iss
+```
+
+Details:
+
+- **`/DAppVersion`** sets the display version. It is single-sourced: the build
+  script reads `__version__` from `redaction_tool/__init__.py` by importing
+  `scripts/version_file.py` (`read_package_version()`) — bump `__version__`
+  and nothing else. If you compile without `/DAppVersion`, a `0.0.0-dev`
+  fallback is used for local checks only; releases must pass the real version.
+- **Output**: `installer\Output\RedactionTool-Setup-<version>.exe`
+  (gitignored). The `[Setup] VersionInfoVersion` fields are numeric-only, so
+  the script strips any `-dev`/`-rc` suffix for those directives while
+  `AppVersion`, `AppVerName`, and the output filename keep the full string —
+  this is why `ISCC /DAppVersion=0.0.0-dev` compiles.
+- **What it installs**: per-user (no UAC) into
+  `{localappdata}\Programs\RedactionTool`, with a Start Menu entry and an
+  uninstaller in Apps & Features. `installer\Code.iss` (included) detects and
+  removes older installed versions, refuses downgrades unless `/ForceDowngrade`
+  is passed, handles a running app, offers to clean up older portable exe
+  copies, and never touches `%USERPROFILE%\.redaction_tool`.
+- **CI**: `.github/workflows/ci.yml` has an `installer-smoke` job that compiles
+  the `.iss` against a throwaway placeholder exe on `windows-latest` and
+  uploads the setup exe as the `installer-smoke` artifact. It is a
+  script-compile smoke test only — no install is performed.
+
+### Manual test matrix
+
+The interactive install/upgrade behaviors cannot be covered by CI. The
+7-scenario manual test matrix (fresh install, upgrade over an older version,
+downgrade refusal + `/ForceDowngrade`, running-instance prompt, portable exe
+older vs. equal/newer cleanup, and user-data survival across upgrade and
+uninstall) is in **PR #4's description**:
+https://github.com/oe-marscruz/redaction-tool/pull/4 — run it on a real
+Windows box before shipping a release that changes `installer\*.iss`.
+
 ## Third-party notices
 
 Before distributing the executable, retain notices for the bundled components

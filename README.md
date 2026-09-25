@@ -70,7 +70,37 @@ Originals are **never modified**. Output files are written as
 `<name>_REDACTED.<ext>` next to the source or into a chosen output folder.
 The tool refuses to write output over the source file.
 
-## Quick start — no install required
+## Install (recommended)
+
+For most people — especially if you are not technical — use the installer:
+
+1. Open the
+   [latest Release page](https://github.com/oe-marscruz/redaction-tool/releases/latest)
+   and download **`RedactionTool-Setup-<version>.exe`** (for example
+   `RedactionTool-Setup-1.2.0.exe`).
+2. Double-click it and follow the wizard. **No admin password is needed** — it
+   installs just for your Windows account, into
+   `C:\Users\<you>\AppData\Local\Programs\RedactionTool`.
+3. Launch it from the Start Menu (there is an optional desktop-icon checkbox
+   in the wizard).
+
+What the installer takes care of for you:
+
+- **Start Menu entry** ("Redaction Tool") and an optional desktop shortcut.
+- **Uninstaller** appears in *Settings → Apps → Installed apps* (Apps &
+  Features) as "Redaction Tool".
+- **Older installed versions** are detected and upgraded automatically; a
+  leftover portable `RedactionTool.exe` you downloaded earlier is offered for
+  cleanup (default answer is *No* — it never deletes anything without asking,
+  and never deletes an equal or newer copy).
+- **Your presets and settings are preserved.** They live in
+  `%USERPROFILE%\.redaction_tool\` and survive both upgrades and uninstalls.
+
+> Note: the setup exe is a new artifact — it appears on the Release page from
+> the first release that includes it onward. Until then, use the portable
+> option below.
+
+### Portable — no install required (alternative)
 
 1. [Download **RedactionTool.exe** from the latest Release](https://github.com/oe-marscruz/redaction-tool/releases/latest)
 2. Double-click it. That's it.

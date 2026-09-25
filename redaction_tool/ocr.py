@@ -13,9 +13,11 @@ Based on ocr-redaction-local v1.0.0 methodology (see references/methodology.md).
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile

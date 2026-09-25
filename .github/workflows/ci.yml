@@ -23,8 +23,9 @@ jobs:
           pip install -r requirements-presidio-optional.txt
 
       - name: Syntax check
+        # PowerShell does not expand shell globs, so let Python do it.
         run: |
-          python -m py_compile redaction_tool/*.py run.py validate_real_files.py
+          python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py')]]"
 
       - name: Unit + regression tests
         run: |
@@ -39,3 +40,54 @@ jobs:
 
       - name: Show self-test result
         run: type result.txt
+
+  # Script-compile smoke test only: this compiles installer\RedactionTool.iss
+  # with ISCC against a throwaway placeholder exe. No install is performed.
+  installer-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Read package version
+        id: version
+        run: |
+          python -c "import sys; sys.path.insert(0, 'scripts'); import version_file; print('version=' + version_file.read_package_version())" >> $env:GITHUB_OUTPUT
+
+      - name: Create placeholder exe
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          [System.IO.File]::WriteAllBytes("dist\RedactionTool.exe", (New-Object byte[] 4096))
+
+      - name: Compile installer (smoke test)
+        run: |
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+          if (-not $iscc) {
+            $onPath = Get-Command iscc -ErrorAction SilentlyContinue
+            if ($onPath) { $iscc = $onPath.Source }
+          }
+          if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer\RedactionTool.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem installer\Output
+
+      - name: Remove placeholder exe
+        if: always()
+        run: Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke
+          path: installer/Output/RedactionTool-Setup-*.exe
+          if-no-files-found: error

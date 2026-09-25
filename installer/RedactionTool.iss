@@ -2,11 +2,16 @@
 ;
 ; Version is single-sourced: layer 4 passes the package version from
 ; redaction_tool/__init__.py at build time, e.g.
-;   ISCC /D AppVersion=1.2.0 installer\RedactionTool.iss
+;   ISCC /DAppVersion=1.2.0 installer\RedactionTool.iss
 ; The fallback below is only for local compile checks.
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
 #endif
+
+; [Setup] VersionInfo* directives accept only numeric x.y.z[.w] versions, so a
+; suffix like "0.0.0-dev" or "1.2.0-rc.1" must be stripped before use there.
+; AppVersion / AppVerName / OutputBaseFilename keep the full display string.
+#define VersionInfoNumeric Pos("-", AppVersion) > 0 ? Copy(AppVersion, 0, Pos("-", AppVersion) - 1) : AppVersion
 
 ; Permanent application identity. Do NOT change once released: later layers
 ; rely on this AppId to detect and upgrade older installs.
@@ -34,8 +39,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 UninstallDisplayName=Redaction Tool
-VersionInfoVersion={#AppVersion}
-VersionInfoProductVersion={#AppVersion}
+VersionInfoVersion={#VersionInfoNumeric}
+VersionInfoProductVersion={#VersionInfoNumeric}
 VersionInfoProductTextVersion={#AppVersion}
 VersionInfoTextVersion={#AppVersion}
 VersionInfoDescription=Redaction Tool Setup
