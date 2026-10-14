@@ -70,10 +70,10 @@ class ScanOptions:
     # Optional local Presidio NER supplement for text and OCR pipelines.
     use_presidio: bool = False
 
-    def run_detection(self, text: str) -> list[Match]:
+    def run_detection(self, text: str, ledger: _ledger.EntityLedger | None = None, context: list[str] | None = None) -> list[Match]:
         return detect(text, self.enabled_categories,
                       self.custom_patterns, self.custom_texts,
-                      use_presidio=self.use_presidio)
+                      use_presidio=self.use_presidio, ledger=ledger, context=context)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,26 +154,29 @@ def _scrub_pdf_attachments(doc, opts: ScanOptions) -> int:
 
 def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     """Permanently redact a PDF via PyMuPDF redaction annotations."""
+    from . import ledger as _ledger
     doc = fitz.open(str(src))
     total = 0
     per_cat: dict[str, int] = {}
+    doc_ledger = _ledger.EntityLedger()
 
+    # Pass 1: Seeding pass across all pages
     for page in doc:
-        # Form-field values are not part of the text stream — scrub widgets
-        # on every page, including pages with no extractable text.
+        page_text = page.get_text()
+        if page_text.strip():
+            opts.run_detection(page_text, ledger=doc_ledger)
+
+    # Pass 2: Redaction pass
+    for page in doc:
         total += _scrub_pdf_widgets(page, opts)
         page_text = page.get_text()
         if not page_text.strip():
             continue
-        matches = opts.run_detection(page_text)
-        # Unique needles for this page, longest first (a longer match
-        # subsumes shorter ones that start inside it).
+        matches = opts.run_detection(page_text, ledger=doc_ledger)
         needles = sorted({m.text for m in matches}, key=len, reverse=True)
         for needle in needles:
             rects = page.search_for(needle)
             if not rects and " " in needle.strip():
-                # Long needles that wrap across lines may not be found
-                # whole — fall back to word-triple chunks.
                 words = needle.split()
                 for i in range(len(words) - 2):
                     rects.extend(page.search_for(" ".join(words[i:i + 3])))
@@ -182,16 +185,11 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
                 total += 1
         for m in matches:
             per_cat[m.category] = per_cat.get(m.category, 0) + 1
-        # PDF_REDACT_IMAGE_NONE keeps embedded images intact; text under the
-        # redaction rect is removed from the content stream.
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    # Scrub invisible containers that survive text redaction:
-    # link URIs (mailto:...?ssn=...) and embedded file attachments.
     total += _scrub_pdf_links(doc, opts)
     total += _scrub_pdf_attachments(doc, opts)
 
-    # Scrub metadata (author, creator, etc. can leak identities).
     try:
         doc.set_metadata({})
         doc.del_xml_metadata()
@@ -207,37 +205,27 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
 # DOCX
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _mask_paragraph(paragraph, opts: ScanOptions) -> tuple[int, dict[str, int]]:
-    """Redact matches inside one paragraph, preserving run formatting.
-
-    Match coordinates are computed against the original paragraph text, then
-    applied to each run in a single pass, so offsets never shift mid-edit.
-    Returns (count, per-category counts).
-    """
+def _mask_paragraph(paragraph, opts: ScanOptions, ledger: _ledger.EntityLedger | None = None) -> tuple[int, dict[str, int]]:
+    """Redact matches inside one paragraph, preserving run formatting."""
     text = paragraph.text
     if not text.strip():
         return 0, {}
-    matches = opts.run_detection(text)
+    matches = opts.run_detection(text, ledger=ledger)
     if not matches:
         return 0, {}
 
-    # Collect runs, including those inside hyperlinks when available.
     runs = list(paragraph.runs)
     for hl in getattr(paragraph, "hyperlinks", []):
         runs.extend(hl.runs)
     if not runs:
         return 0, {}
 
-    # Map paragraph coordinates → run coordinates.
-    spans: list[tuple[int, int, object]] = []  # (start, end, run)
+    spans: list[tuple[int, int, object]] = []
     pos = 0
     for r in runs:
         spans.append((pos, pos + len(r.text), r))
         pos += len(r.text)
 
-    # Gather per-run edit intervals in original coordinates.  A match that
-    # spans runs inserts the replacement token in its first run and blanks
-    # the continuation runs.
     run_edits: dict[int, list[tuple[int, int, str]]] = {}
     per_cat: dict[str, int] = {}
     masked = 0
@@ -259,7 +247,6 @@ def _mask_paragraph(paragraph, opts: ScanOptions) -> tuple[int, dict[str, int]]:
         run = spans[idx][2]
         txt = run.text
         edits.sort()
-        # Merge overlapping intervals (keep the first replacement token).
         merged: list[list] = []
         for ls, le, repl in edits:
             if merged and ls <= merged[-1][1]:
@@ -277,22 +264,13 @@ def _mask_paragraph(paragraph, opts: ScanOptions) -> tuple[int, dict[str, int]]:
     return masked, per_cat
 
 
-# Parts whose entire content lives outside the python-docx object model.
 _DOCX_HIDDEN_PART_SUFFIXES = (
     "footnotes.xml", "endnotes.xml", "comments.xml",
 )
 
 
-def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
-    """Redact text python-docx's API cannot reach:
-
-    - drawing text boxes (``w:txbxContent``) in any story part;
-    - footnotes, endnotes, and comments (loaded as opaque blob parts with
-      no ``.element``), patched by re-serializing their XML.
-
-    Without this, PII in letterhead shapes or footnote text survives
-    redaction untouched.
-    """
+def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.EntityLedger | None = None) -> tuple[int, dict[str, int]]:
+    """Redact text python-docx's API cannot reach."""
     from docx.oxml.ns import qn
     from lxml import etree
 
@@ -301,8 +279,7 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[st
     total = 0
     per_cat: dict[str, int] = {}
 
-    def _mask_paragraph(w_p) -> tuple[int, dict[str, int]]:
-        """Mask detected spans across the w:t elements of one raw w:p."""
+    def _mask_paragraph_el(w_p) -> tuple[int, dict[str, int]]:
         count = 0
         cats: dict[str, int] = {}
         t_elems = list(w_p.iter(W_T))
@@ -310,7 +287,7 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[st
             return 0, {}
         texts = [t.text or "" for t in t_elems]
         full = "".join(texts)
-        matches = opts.run_detection(full)
+        matches = opts.run_detection(full, ledger=ledger)
         if not matches:
             return 0, {}
 
@@ -360,17 +337,14 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[st
         root = getattr(part, "element", None)
 
         if root is not None:
-            # Structured parts (body, headers, footers): text boxes only.
             for txbx in root.iter(qn("w:txbxContent")):
                 for w_p in txbx.iter(W_P):
-                    n, cats = _mask_paragraph(w_p)
+                    n, cats = _mask_paragraph_el(w_p)
                     total += n
                     for k, v in cats.items():
                         per_cat[k] = per_cat.get(k, 0) + v
             continue
 
-        # Opaque blob parts (footnotes / endnotes / comments): parse, mask,
-        # and re-serialize the whole part.
         if not partname.endswith(_DOCX_HIDDEN_PART_SUFFIXES):
             continue
         try:
@@ -382,7 +356,7 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[st
             continue
         part_count = 0
         for w_p in root.iter(W_P):
-            n, cats = _mask_paragraph(w_p)
+            n, cats = _mask_paragraph_el(w_p)
             part_count += n
             total += n
             for k, v in cats.items():
@@ -396,18 +370,13 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions) -> tuple[int, dict[st
     return total, per_cat
 
 
-def _redact_docx_textboxes(document, opts: ScanOptions) -> tuple[int, dict[str, int]]:
+def _redact_docx_textboxes(document, opts: ScanOptions, ledger: _ledger.EntityLedger | None = None) -> tuple[int, dict[str, int]]:
     """Backward-compatible alias for the generalized hidden-parts scrub."""
-    return _redact_docx_hidden_parts(document, opts)
+    return _redact_docx_hidden_parts(document, opts, ledger=ledger)
 
 
 def _scrub_opc_app_xml(path: Path) -> None:
-    """Blank Manager / Company fields in docProps/app.xml of an OPC file.
-
-    python-docx and openpyxl don't expose app properties, but 'Manager' can
-    contain a person's name.  Rewrites the zip in place when a change is
-    needed.  Applies to DOCX and XLSX output files.
-    """
+    """Blank Manager / Company fields in docProps/app.xml of an OPC file."""
     import zipfile
     try:
         with zipfile.ZipFile(path) as z:
@@ -433,9 +402,11 @@ def _scrub_opc_app_xml(path: Path) -> None:
 
 
 def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str, int]]:
+    from . import ledger as _ledger
     document = docx.Document(str(src))
     total = 0
     per_cat: dict[str, int] = {}
+    doc_ledger = _ledger.EntityLedger()
 
     def _accumulate(count: int, cats: dict[str, int]) -> None:
         nonlocal total
@@ -443,21 +414,44 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
         for k, v in cats.items():
             per_cat[k] = per_cat.get(k, 0) + v
 
+    # Pass 1: Seed ledger
+    for para in document.paragraphs:
+        if para.text.strip():
+            opts.run_detection(para.text, ledger=doc_ledger)
+    def _seed_tables(tables):
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        if para.text.strip():
+                            opts.run_detection(para.text, ledger=doc_ledger)
+                    _seed_tables(cell.tables)
+    _seed_tables(document.tables)
+    for section in document.sections:
+        for part in (section.header, section.footer,
+                     section.first_page_header, section.first_page_footer,
+                     section.even_page_header, section.even_page_footer):
+            if part is None:
+                continue
+            for para in part.paragraphs:
+                if para.text.strip():
+                    opts.run_detection(para.text, ledger=doc_ledger)
+            _seed_tables(part.tables)
+
+    # Pass 2: Apply redactions
     def _process_paragraphs(paragraphs) -> None:
         for para in paragraphs:
-            _accumulate(*_mask_paragraph(para, opts))
+            _accumulate(*_mask_paragraph(para, opts, ledger=doc_ledger))
 
     def _process_tables(tables) -> None:
         for table in tables:
             for row in table.rows:
                 for cell in row.cells:
                     _process_paragraphs(cell.paragraphs)
-                    _process_tables(cell.tables)  # nested tables
+                    _process_tables(cell.tables)
 
-    # Body
     _process_paragraphs(document.paragraphs)
     _process_tables(document.tables)
-    # Headers / footers (often contain names, case numbers, dates)
     for section in document.sections:
         for part in (section.header, section.footer,
                      section.first_page_header, section.first_page_footer,
@@ -467,11 +461,8 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
             _process_paragraphs(part.paragraphs)
             _process_tables(part.tables)
 
-    # Text boxes / shapes (letterhead PII lives here — python-docx's
-    # paragraph API never sees it)
-    _accumulate(*_redact_docx_textboxes(document, opts))
+    _accumulate(*_redact_docx_hidden_parts(document, opts, ledger=doc_ledger))
 
-    # Scrub document properties.
     try:
         cp = document.core_properties
         for attr in ("author", "last_modified_by", "title", "subject",
@@ -492,10 +483,6 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
 # XLSX
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Header labels → detection category.  Spreadsheets like HR exports store
-# PII in dedicated columns ("First Name", "Empl ID", numeric IDs, real
-# dates) where per-cell text detection cannot help — so when a category is
-# enabled, every value under a matching header is redacted wholesale.
 _HEADER_MAP: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^\s*(?:(?:first|last|full|middle|preferred|maiden|nick\s?|"
                 r"supervisor|employee|student|patient|client|parent|guardian|"
@@ -535,22 +522,47 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                   out: Path | None = None) -> tuple[int, dict[str, int]]:
     """Scan (out=None) or redact (out=path) a workbook with one procedure,
     keeping scan counts and redaction counts identical."""
+    from . import ledger as _ledger
+    from .detector import _dedupe
     wb = openpyxl.load_workbook(str(src))
     total = 0
     per_cat: dict[str, int] = {}
-    enabled = (set(opts.enabled_categories) if opts.enabled_categories
-               else set(CATEGORY_MAP))
 
+    if opts.enabled_categories is None:
+        enabled = set(CATEGORY_MAP)
+    else:
+        enabled = set(opts.enabled_categories)
+
+    doc_ledger = _ledger.EntityLedger()
+
+    # Pass 1: Seeding pass
     for ws in wb.worksheets:
-        header_cols = _header_columns(ws, enabled)
+        header_cols = _header_columns(ws, enabled) if enabled else {}
         for row in ws.iter_rows():
             for cell in row:
-                # Cell comments / notes — invisible in the grid, but part
-                # of the file.  Check every cell (clean values can still
-                # carry PII in their comment).
+                comment = getattr(cell, "comment", None)
+                if comment is not None and comment.text:
+                    opts.run_detection(comment.text, ledger=doc_ledger)
+
+                hc = header_cols.get(cell.column)
+                header_text = None
+                if hc and cell.row > hc[0]:
+                    h_val = ws.cell(row=hc[0], column=cell.column).value
+                    if h_val is not None:
+                        header_text = str(h_val).strip()
+
+                value = cell.value
+                if isinstance(value, str) and value.strip():
+                    opts.run_detection(value, ledger=doc_ledger, context=[header_text] if header_text else None)
+
+    # Pass 2: Redaction / Detection pass
+    for ws in wb.worksheets:
+        header_cols = _header_columns(ws, enabled) if enabled else {}
+        for row in ws.iter_rows():
+            for cell in row:
                 comment = getattr(cell, "comment", None)
                 if comment is not None:
-                    c_matches = opts.run_detection(comment.text or "")
+                    c_matches = opts.run_detection(comment.text or "", ledger=doc_ledger)
                     if c_matches:
                         for m in c_matches:
                             per_cat[m.category] = per_cat.get(m.category, 0) + 1
@@ -558,34 +570,40 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                         if out is not None:
                             cell.comment = None
 
-                # Header-mapped column: redact the whole value (any type).
                 hc = header_cols.get(cell.column)
-                if hc and cell.row > hc[0] and cell.value is not None \
-                        and str(cell.value).strip():
+                header_text = None
+                if hc and cell.row > hc[0]:
+                    h_val = ws.cell(row=hc[0], column=cell.column).value
+                    if h_val is not None:
+                        header_text = str(h_val).strip()
+
+                if hc and cell.row > hc[0] and cell.value is not None and str(cell.value).strip():
                     per_cat[hc[1]] = per_cat.get(hc[1], 0) + 1
                     total += 1
                     if out is not None:
                         cell.value = opts.replacement
                     continue
-                # Otherwise: per-cell text detection.
+
                 value = cell.value
                 if not isinstance(value, str) or not value.strip():
                     continue
-                matches = opts.run_detection(value)
+
+                matches = opts.run_detection(value, ledger=doc_ledger, context=[header_text] if header_text else None)
                 if not matches:
                     continue
-                new_value = value
+
                 for m in matches:
                     per_cat[m.category] = per_cat.get(m.category, 0) + 1
                     total += 1
-                    if out is not None:
-                        pattern = re.compile(rf"\b{re.escape(m.text)}\b",
-                                             re.IGNORECASE)
-                        new_value = pattern.sub(opts.replacement, new_value)
-                if out is not None:
-                    cell.value = new_value
 
-        # Sheet headers / footers (print headers can carry names, IDs).
+                if out is not None:
+                    cell_matches = _dedupe(matches)
+                    cell_matches.sort(key=lambda x: x.start, reverse=True)
+                    chars = list(value)
+                    for m in cell_matches:
+                        chars[m.start:m.end] = list(opts.replacement)
+                    cell.value = "".join(chars)
+
         for hf in (ws.oddHeader, ws.evenHeader, ws.firstHeader,
                    ws.oddFooter, ws.evenFooter, ws.firstFooter):
             if hf is None:
@@ -594,10 +612,13 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                 text = getattr(section, "text", None)
                 if not text:
                     continue
-                h_matches = opts.run_detection(text)
+                h_matches = opts.run_detection(text, ledger=doc_ledger)
                 if h_matches:
                     for m in h_matches:
                         per_cat[m.category] = per_cat.get(m.category, 0) + 1
+                        total += 1
+                    if out is not None:
+                        section.text = ""
                         total += 1
                     if out is not None:
                         section.text = ""
@@ -785,12 +806,11 @@ def redact_file(src_path: str | Path,
                 for m in opts.run_detection(unit):
                     if len(m.text) >= 4:
                         needles.append(m.text)
-            if needles:
-                report = _verify.verify_export(out_path, needles)
-                result.recoverability = report["status"]
-                result.recoverability_leaked = int(report.get("leaked_count") or 0)
-                if report["status"] == "ERROR":
-                    result.error = report.get("reason") or "recoverability check failed"
+            report = _verify.verify_export(out_path, targeted_values=needles, scan_opts=opts)
+            result.recoverability = report["status"]
+            result.recoverability_leaked = int(report.get("leaked_count") or 0)
+            if report["status"] == "ERROR":
+                result.error = report.get("reason") or "recoverability check failed"
         except Exception:
             result.recoverability = "NEEDS_REVIEW"
 

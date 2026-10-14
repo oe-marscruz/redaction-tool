@@ -38,9 +38,6 @@ def _doc(doc_id: str, text: str, pairs: list[tuple[str, str, list[str]]],
          doc_type: str, tags: list[str] | None = None) -> Document:
     ents: list[GoldEntity] = []
     used: set[tuple[int, int, str]] = set()
-    search_from = 0
-    # Sequential find so repeated values still get distinct spans when listed
-    # multiple times; fall back to str.index for unique values.
     remaining = list(pairs)
     cursor = {i: 0 for i in range(len(remaining))}
     for i, (value, category, etags) in enumerate(remaining):
@@ -53,7 +50,6 @@ def _doc(doc_id: str, text: str, pairs: list[tuple[str, str, list[str]]],
         cursor[i] = end
         key = (start, end, category)
         if key in used:
-            # find next occurrence
             start = text.find(value, end)
             if start < 0:
                 start = text.find(value)
@@ -129,17 +125,6 @@ _NAME_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] 
 
 
 def _more_name_docs() -> list[Document]:
-    firsts = [
-        "Zainab", "Ioannis", "Saoirse", "Bjorn", "Nguyen", "Fatou", "Mateo",
-        "Hana", "Yusuf", "Ines", "Kwame", "Soren", "Leilani", "Dmitri",
-        "Amara", "Tariq", "Nalini", "Oskar", "Chiara", "Jabari",
-    ]
-    lasts = [
-        "Okoye", "Papadopoulos", "Ní Bhraonáin", "Johansson", "Pham",
-        "Diallo", "Silva", "Nakamura", "Haddad", "Costa", "Mensah",
-        "Lindgren", "Kealoha", "Volkov", "Diallo", "Rahman", "Iyer",
-        "Berg", "Rossi", "Abebe",
-    ]
     docs: list[Document] = []
     templates = [
         ("The student {f} {l} requested an advising meeting.", "education", ["unlabeled"]),
@@ -182,7 +167,7 @@ def _more_name_docs() -> list[Document]:
             value = f"{f} {l}"
         n += 1
         docs.append(_doc(f"n_gen_{n:03d}", text, [(value, "names", tags)], dtype, tags))
-    # Repeat across more templates to push entity count up.
+
     more_tmpls = [
         ("Advising note: {f} {l} missed two sessions.", "education", ["narrative"]),
         ("Discharge: {f} {l} left against medical advice.", "healthcare", ["unlabeled"]),
@@ -262,11 +247,8 @@ _DATE_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] 
 def _more_date_docs() -> list[Document]:
     numeric = [
         "01/02/26", "1/2/26", "01-02-2026", "2026-01-02", "01.02.2026",
-        "12/31/99", "3/15/24", "07/04/1776",  # 1776 won't match 19|20 — gold still dates historically; skip
-        "11/08/2024", "9/9/09", "10/10/10",
+        "12/31/99", "3/15/24", "11/08/2024", "9/9/09", "10/10/10",
     ]
-    # Drop 07/04/1776 — out of modern range and not required.
-    numeric = [d for d in numeric if "1776" not in d]
     docs: list[Document] = []
     contexts = [
         ("Admitted {d}.", "healthcare", ["admission"]),
@@ -282,6 +264,7 @@ def _more_date_docs() -> list[Document]:
         tmpl, dtype, tags = contexts[i % len(contexts)]
         text = tmpl.format(d=d)
         docs.append(_doc(f"d_gen_{i:03d}", text, [(d, "dates", tags)], dtype, tags))
+
     months = [
         ("January 3, 2024", "education"),
         ("3 January 2024", "healthcare"),
@@ -293,6 +276,7 @@ def _more_date_docs() -> list[Document]:
     for i, (d, dtype) in enumerate(months):
         text = f"Service date {d} is recorded."
         docs.append(_doc(f"d_mon_{i:03d}", text, [(d, "dates", ["month_name"])], dtype, ["month_name"]))
+
     extra_dates = [
         "02/28/25", "2/28/25", "02-28-2025", "2025-02-28", "28 Feb 2025",
         "February 28, 2025", "28-Feb-25", "02.28.2025", "6/1/24", "06/01/2024",
@@ -313,6 +297,7 @@ def _more_date_docs() -> list[Document]:
         tmpl, dtype = extra_ctx[i % len(extra_ctx)]
         text = tmpl.format(d=d)
         docs.append(_doc(f"d_bulk_{i:03d}", text, [(d, "dates", ["bulk"])], dtype, ["bulk"]))
+
     relatives = [
         ("yesterday", "Symptoms began yesterday."),
         ("tomorrow", "Surgery is tomorrow."),
@@ -385,6 +370,24 @@ _STRUCT_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]
 ]
 
 
+# ── US Structured IDs supported by Presidio ─────────────────────────────────
+
+_PRESIDIO_US_ID_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] = [
+    ("pid01", "US Passport No. 987654321 issued to traveler.",
+     [("987654321", "unique_ids", ["passport"])], ["presidio", "education"]),
+    ("pid02", "Driver License D1234567 on record.",
+     [("D1234567", "licenses", ["driver_license"])], ["presidio", "healthcare"]),
+    ("pid03", "Taxpayer ITIN 912-34-5678 submitted.",
+     [("912-34-5678", "ssn", ["itin"])], ["presidio", "financial"]),
+    ("pid04", "Visa card 4532 0151 1283 0366 charged.",
+     [("4532 0151 1283 0366", "financial", ["credit_card"])], ["presidio", "financial"]),
+    ("pid05", "Host IP 192.168.1.100 connected to server.",
+     [("192.168.1.100", "ips", ["ipv4"])], ["presidio", "technology"]),
+    ("pid06", "MAC address 00:0a:95:9d:68:16 assigned to adapter.",
+     [("00:0a:95:9d:68:16", "devices", ["mac"])], ["presidio", "technology"]),
+]
+
+
 def _more_struct_docs() -> list[Document]:
     docs: list[Document] = []
     emails = [f"user{i}@campus.edu" for i in range(20)]
@@ -430,6 +433,30 @@ _OCR_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] =
      [("04/\n17/2026", "dates", ["line_break"])], ["ocr", "healthcare"]),
     ("o10", "Parent Xiuying\nZhang called.",
      [("Xiuying\nZhang", "names", ["line_break"])], ["ocr", "education"]),
+]
+
+
+# ── Document boundaries & Unicode punctuation ──────────────────────────────
+
+_BOUNDARY_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] = [
+    ("b01", "Jane Doe attended the hearing.",
+     [("Jane Doe", "names", ["boundary_start"])], ["boundary"]),
+    ("b02", "Send transcript to student.doe@university.edu",
+     [("student.doe@university.edu", "emails", ["boundary_end"])], ["boundary"]),
+    ("b03", "\n\nSSN 123-45-6789\n\n",
+     [("123-45-6789", "ssn", ["boundary_newlines"])], ["boundary"]),
+]
+
+_UNICODE_CASES: list[tuple[str, str, list[tuple[str, str, list[str]]], list[str]]] = [
+    ("u01", "Patient María-José García visited clinic.",
+     [("María-José García", "names", ["diacritics"])], ["unicode"]),
+    ("u02", "Alias: “Frankie” DiMartino.",
+     [("Frankie", "names", ["curly_quotes"]),
+      ("DiMartino", "names", ["curly_quotes"])], ["unicode"]),
+    ("u03", "DOB 05·14·2002 on file.",
+     [("05·14·2002", "dates", ["interpunct"])], ["unicode"]),
+    ("u04", "Parent—Xiuying Zhang called.",
+     [("Xiuying Zhang", "names", ["em_dash"])], ["unicode"]),
 ]
 
 
@@ -496,6 +523,12 @@ _NEGATIVES: list[tuple[str, str, str]] = [
     ("neg13", "Grade appeals follow Faculty Council rules.", "education"),
     ("neg14", "IP as in intellectual property is out of scope here.", "education"),
     ("neg15", "See Table 4 for aggregate counts only.", "healthcare"),
+    ("neg16", "Order # 987654 was processed by logistics.", "education"),
+    ("neg17", "PO-2026-8812 approved by procurement department.", "education"),
+    ("neg18", "CS-101 meets in Room 101, Building A.", "education"),
+    ("neg19", "Item catalog # 55432 is currently in stock.", "education"),
+    ("neg20", "Section 4.5.6 of the maintenance manual.", "education"),
+    ("neg21", "Invoice 887766 paid in full on schedule.", "financial"),
 ]
 
 
@@ -510,8 +543,14 @@ def build_corpus() -> list[Document]:
     for doc_id, text, pairs, tags in _STRUCT_CASES:
         docs.append(_doc(doc_id, text, pairs, tags[0] if tags else "general", tags))
     docs.extend(_more_struct_docs())
+    for doc_id, text, pairs, tags in _PRESIDIO_US_ID_CASES:
+        docs.append(_doc(doc_id, text, pairs, tags[0] if tags else "presidio", tags))
     for doc_id, text, pairs, tags in _OCR_CASES:
         docs.append(_doc(doc_id, text, pairs, tags[0] if tags else "ocr", tags))
+    for doc_id, text, pairs, tags in _BOUNDARY_CASES:
+        docs.append(_doc(doc_id, text, pairs, tags[0] if tags else "boundary", tags))
+    for doc_id, text, pairs, tags in _UNICODE_CASES:
+        docs.append(_doc(doc_id, text, pairs, tags[0] if tags else "unicode", tags))
     for doc_id, text, pairs, dtype, tags in _MULTI:
         docs.append(_doc(doc_id, text, pairs, dtype, tags))
     for doc_id, text, dtype in _NEGATIVES:

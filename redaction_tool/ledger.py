@@ -58,28 +58,34 @@ class EntityLedger:
         name = " ".join(name.split())
         if len(name) < 2:
             return
-        self.names.add(name)
-        self._variants.add(name)
         toks = _tokens(name)
         if not toks:
             return
+        if len(toks) == 1:
+            w = toks[0].lower().rstrip(".")
+            if w in _COMMON_LAST or w in _COMMON_FIRST or w in _PARTICLES:
+                return
+            if len(toks[0]) >= 3 and toks[0][0].isupper():
+                self.names.add(name)
+                self._variants.add(toks[0])
+            return
+
+        self.names.add(name)
+        self._variants.add(name)
         first, last = toks[0].rstrip("."), toks[-1].rstrip(".")
-        # Drop trailing middle initials from last if we grabbed "A." as last.
         if last.endswith(".") and len(last) <= 2 and len(toks) >= 2:
             last = toks[-2].rstrip(".")
         if len(first) >= 3:
-            self._variants.add(first)
-            self._variants.add(first + "'s")
-            self._variants.add(first + "’s")
+            if first.lower() not in _COMMON_FIRST or first[0].isupper():
+                self._variants.add(first)
+                self._variants.add(first + "'s")
+                self._variants.add(first + "’s")
         if len(last) >= 3:
-            # Capitalized last-name only; skip lowercase common words.
             if last.lower() not in _COMMON_LAST or last[0].isupper():
                 if last.lower() not in _COMMON_LAST:
                     self._variants.add(last)
                     self._variants.add(last + "'s")
                 elif last[0].isupper() and last.lower() not in {"may", "june", "april"}:
-                    # Still propagate Title-Case common surnames (Brown) but
-                    # matching is later required to be Title-Case / ALL-CAPS.
                     self._variants.add(last)
             for hon in _HONORIFICS:
                 self._variants.add(f"{hon} {last}")

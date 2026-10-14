@@ -226,6 +226,7 @@ def span_bbox(words: list[OCRWord], start: int, end: int,
 
 def detect_on_ocr(words: list[OCRWord],
                   scan_opts: Optional["redactor_ScanOptions"] = None,
+                  ledger: Optional["_ledger.EntityLedger"] = None,
                   ) -> tuple[list[dict], list[str]]:
     """Run our 19-category detector against OCR-extracted text.
 
@@ -239,7 +240,7 @@ def detect_on_ocr(words: list[OCRWord],
     from .redactor import ScanOptions  # late import to avoid circular
     opts = scan_opts or ScanOptions()
     text = ocr_text(words)
-    matches = opts.run_detection(text)  # uses our full detector.py
+    matches = opts.run_detection(text, ledger=ledger)  # uses our full detector.py
     warnings: list[str] = []
 
     salt = getattr(opts, "hash_salt", "") or ""
@@ -375,30 +376,36 @@ def scan_ocr_pdf(pdf_path: Path, dpi: int = 200, lang: str = "eng",
     pixel space to PDF points (1 pt = 1/72 inch) before being stored.
     """
     from .redactor import ScanOptions
+    from . import ledger as _ledger
     pymupdf = _require_pymupdf()
     doc = pymupdf.open(str(pdf_path))
     plan = new_plan(pdf_path.name, "pdf", dpi=dpi, lang=lang)
     opts = scan_opts or ScanOptions()
     scale = dpi / 72.0
     detection_idx = 0
+    doc_ledger = _ledger.EntityLedger()
 
     with tempfile.TemporaryDirectory(prefix="ocr-redact-") as td:
+        page_words: list[tuple[int, list[OCRWord]]] = []
         for pno, page in enumerate(doc, start=1):
             pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             img_path = Path(td) / f"page-{pno:04d}.png"
             pix.save(str(img_path))
             try:
                 words = run_ocr(img_path, lang=lang, tesseract_cmd=tesseract_cmd)
+                page_words.append((pno, words))
+                page_text = ocr_text(words)
+                opts.run_detection(page_text, ledger=doc_ledger)
             except Exception as exc:
                 plan["warnings"].append(f"Page {pno}: OCR failed — {exc}")
-                continue
-            entries, page_warnings = detect_on_ocr(words, scan_opts=opts)
+
+        for pno, words in page_words:
+            entries, page_warnings = detect_on_ocr(words, scan_opts=opts, ledger=doc_ledger)
             plan["warnings"].extend(page_warnings)
             for entry in entries:
                 detection_idx += 1
                 entry["id"] = f"d{detection_idx:05d}"
                 entry["page"] = pno
-                # Convert pixel bbox → PDF points
                 l, t, r, b = entry["bbox"]
                 entry["bbox"] = [
                     round(l / scale, 3), round(t / scale, 3),
@@ -416,10 +423,12 @@ def scan_ocr_image(image_path: Path, lang: str = "eng",
                    ) -> dict:
     """OCR a standalone image and return a redaction plan."""
     from .redactor import ScanOptions
+    from . import ledger as _ledger
     opts = scan_opts or ScanOptions()
+    doc_ledger = _ledger.EntityLedger()
     plan = new_plan(image_path.name, "image", lang=lang)
     words = run_ocr(image_path, lang=lang, tesseract_cmd=tesseract_cmd)
-    entries, warnings = detect_on_ocr(words, scan_opts=opts)
+    entries, warnings = detect_on_ocr(words, scan_opts=opts, ledger=doc_ledger)
     plan["warnings"].extend(warnings)
     for i, entry in enumerate(entries, 1):
         entry["id"] = f"d{i:05d}"

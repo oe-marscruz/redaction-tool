@@ -5,6 +5,13 @@ Python runtime, Presidio Analyzer, spaCy's English small model, Tesseract, and
 English OCR trained data. The executable does not download any models or send
 document text to a service.
 
+## Offline & Release Security Guarantee
+
+- **Zero Outbound Network at Runtime**: Redaction, OCR, and Presidio analysis operate entirely locally.
+- **Dependency Freeze**: Pinned versions are `presidio-analyzer==2.2.364`, `spacy==3.8.11`, and `en_core_web_sm-3.8.0`.
+- **Packaged Self-Test**: The build pipeline validates `dist\RedactionTool.exe` using `--selftest --require-ocr --require-presidio`.
+- **Environment Status Gate**: If required local vendor assets or Python packages are missing on the build host, packaging/verification is reported as `BLOCKED (environment)`, never falsely marked as `PASS`.
+
 ## Prerequisites
 
 - 64-bit Windows and CPython 3.13.
@@ -62,6 +69,22 @@ PyInstaller extracts its bundled files to a temporary directory at launch.
 Test the resulting executable on a clean machine without Python, Tesseract,
 or network access before distributing it.
 
+### Release chain of custody
+
+The build does not code-sign `dist\RedactionTool.exe` or the installer, so both
+are unsigned and Windows SmartScreen will warn on first run. Before distributing
+a release, record the provenance of the exact artifact:
+
+- Build only from a reviewed commit that passed CI, and note the commit SHA.
+- Record the SHA-256 of `dist\RedactionTool.exe` and of the compiled
+  `installer\Output\RedactionTool-Setup-<version>.exe`, and publish those digests
+  with the release so recipients can verify what they downloaded.
+- Confirm `exe_selftest.txt` reports both `PASS bundled OCR` and
+  `PASS bundled Presidio` for that artifact.
+- Signing requires a code-signing certificate and is out of scope for this
+  repository's build script; if a release needs a signed binary, add signing as
+  a separate, reviewed step rather than treating the unsigned artifact as final.
+
 ## Installer (Inno Setup)
 
 `build_windows.ps1` also compiles a per-user installer after the exe
@@ -99,20 +122,15 @@ Details:
   removes older installed versions, refuses downgrades unless `/ForceDowngrade`
   is passed, handles a running app, offers to clean up older portable exe
   copies, and never touches `%USERPROFILE%\.redaction_tool`.
-- **CI**: `.github/workflows/ci.yml` has an `installer-smoke` job that compiles
-  the `.iss` against a throwaway placeholder exe on `windows-latest` and
-  uploads the setup exe as the `installer-smoke` artifact. It is a
-  script-compile smoke test only — no install is performed.
-
-### Manual test matrix
-
-The interactive install/upgrade behaviors cannot be covered by CI. The
-7-scenario manual test matrix (fresh install, upgrade over an older version,
-downgrade refusal + `/ForceDowngrade`, running-instance prompt, portable exe
-older vs. equal/newer cleanup, and user-data survival across upgrade and
-uninstall) is in **PR #4's description**:
-https://github.com/oe-marscruz/redaction-tool/pull/4 — run it on a real
-Windows box before shipping a release that changes `installer\*.iss`.
+- **CI**: `.github/workflows/ci.yml` has a `test` job that runs the unit,
+  regression, security, Presidio integration, and end-to-end suites plus the
+  synthetic evaluation corpus and the headless self-test, and an
+  `installer-smoke` job that runs `build_windows.ps1` for real on
+  `windows-latest`, asserts the packaged `PASS bundled OCR` and
+  `PASS bundled Presidio` self-test lines, and uploads the resulting setup exe
+  as the `installer-smoke` artifact. The build job verifies the pinned spaCy
+  model hash via `scripts/check_model_pin.py` before building, so a malformed
+  or drifted pin fails fast instead of only inside the release build.
 
 ## Third-party notices
 

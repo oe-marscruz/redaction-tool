@@ -44,7 +44,13 @@ if (-not (Test-Path $modelWheel)) {
     $modelUrl = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
     Invoke-WebRequest -Uri $modelUrl -OutFile $modelWheel -UseBasicParsing
 }
-$modelSha256 = "1932429DB7277D4BFF3DEED6B34CFC05DF17794F4A52EEB26CF8928F7C1A0FB85"
+# Must match the sha256= fragment in requirements-presidio-optional.txt.
+# Get-FileHash always returns 64 uppercase hex characters, so a constant of any
+# other length makes this gate throw unconditionally.
+$modelSha256 = "1932429DB727D4BFF3DEED6B34CFC05DF17794F4A52EEB26CF8928F7C1A0FB85"
+if ($modelSha256.Length -ne 64) {
+    throw "Pinned spaCy model SHA-256 must be 64 hex characters, got $($modelSha256.Length)."
+}
 if ((Get-FileHash -LiteralPath $modelWheel -Algorithm SHA256).Hash -ne $modelSha256) {
     throw "spaCy model wheel SHA-256 did not match the pinned asset."
 }
@@ -64,10 +70,14 @@ Invoke-BuildPython @("-m", "PyInstaller", "--noconfirm", "--clean", "RedactionTo
 
 $selftestPath = Join-Path $root "exe_selftest.txt"
 $quotedSelftestPath = '"' + $selftestPath + '"'
-Start-Process -FilePath (Join-Path $root "dist\RedactionTool.exe") -ArgumentList @(
+# Note: do NOT pipe Start-Process -PassThru into ForEach-Object. On Windows
+# PowerShell 5.1 that yields an empty ExitCode, which made every successful
+# build throw here and skip the installer step below.
+$selftestProcess = Start-Process -FilePath (Join-Path $root "dist\RedactionTool.exe") -ArgumentList @(
     "--selftest", $quotedSelftestPath, "--require-ocr", "--require-presidio"
-) -Wait -PassThru | ForEach-Object {
-    if ($_.ExitCode -ne 0) { throw "Packaged self-test failed with exit $($_.ExitCode). See exe_selftest.txt." }
+) -Wait -PassThru
+if ($selftestProcess.ExitCode -ne 0) {
+    throw "Packaged self-test failed with exit $($selftestProcess.ExitCode). See exe_selftest.txt."
 }
 Assert-Asset (Join-Path $root "exe_selftest.txt") "packaged self-test report"
 if ((Get-Content (Join-Path $root "exe_selftest.txt") -Raw) -notmatch "PASS bundled OCR" -or
@@ -87,6 +97,11 @@ function Find-Iscc {
     }
     if ($env:LOCALAPPDATA) {
         $candidates += (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+    }
+    # Chocolatey installs ISCC under ProgramData rather than Program Files.
+    if ($env:ProgramData) {
+        $candidates += (Join-Path $env:ProgramData "chocolatey\bin\ISCC.exe")
+        $candidates += (Join-Path $env:ProgramData "chocolatey\lib\innosetup\tools\ISCC.exe")
     }
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate) { return $candidate }

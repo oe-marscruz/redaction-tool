@@ -640,17 +640,18 @@ class App:
     # pass covers both the text layer and raster content; otherwise the
     # text-based detector re-scans the output.
     def _verify_one(self, path: Path, opts, use_ocr: bool) -> dict:
-        ext = path.suffix.lower()
         try:
-            if ext in ocr.IMAGE_EXTS or (ext == ".pdf" and use_ocr):
-                v = ocr.verify_ocr(path, scan_opts=opts)
-                return {"status": v["status"],
-                        "residual": v["remaining_detection_count"],
-                        "warnings": v["warnings"]}
-            counts = redactor.scan_file(path, opts)
-            n = sum(counts.values())
-            return {"status": "PASS" if n == 0 else "NEEDS_REVIEW",
-                    "residual": n, "warnings": []}
+            from . import verify as _verify
+            v = _verify.verify_export(path, scan_opts=opts, use_ocr=use_ocr)
+            res_c = v.get("residual_count", 0)
+            if res_c < 0:
+                res_c = None
+            return {
+                "status": v["status"],
+                "residual": res_c,
+                "warnings": v.get("warnings", []),
+                "reason": v.get("reason", ""),
+            }
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "residual": None, "warnings": [str(exc)]}
 
@@ -812,16 +813,17 @@ class App:
                             else path.with_name(f"{path.stem}{suffix}{ext}"))
                 try:
                     plan = ocr.scan_ocr_image(path, scan_opts=opts)
+                    if plan.get("warnings"):
+                        failed += 1
+                        entry["errors"].extend(plan["warnings"])
+                        lines.append(f"{name}:  OCR ERROR — {'; '.join(plan['warnings'])}")
+                        log_entries.append(entry)
+                        continue
                     ocr.apply_ocr_redactions(path, plan, out_path)
-                    ok += 1
                     entry["outputs"] = [str(out_path)]
                     entry["ocr_used"] = True
                     entry["plan"] = {"detections": len(plan["detections"]),
                                      "warnings": plan["warnings"]}
-                    lines.append(f"{name}:  {len(plan['detections'])} OCR redaction(s) applied")
-                    lines.append(f"    → {out_path}")
-                    outputs.append(out_path)
-                    # Persist the full redaction plan (audit artifact).
                     try:
                         plan_path = out_path.with_suffix(out_path.suffix + ".plan.json")
                         plan_path.write_text(json.dumps(plan, indent=2),
@@ -829,6 +831,19 @@ class App:
                         entry["plan_file"] = str(plan_path)
                     except Exception:
                         pass
+
+                    v = self._verify_one(out_path, opts, use_ocr=True)
+                    entry["verify"] = v
+                    if v["status"] == "PASS":
+                        ok += 1
+                        lines.append(f"{name}:  {len(plan['detections'])} OCR redaction(s) applied")
+                        lines.append(f"    → {out_path}")
+                        lines.append("    VERIFY: PASS")
+                        outputs.append(out_path)
+                    else:
+                        failed += 1
+                        entry["errors"].append(f"Verification status: {v['status']}")
+                        lines.append(f"{name}:  VERIFY FAILED — {v['status']}")
                 except Exception as exc:  # noqa: BLE001
                     failed += 1
                     entry["errors"].append(str(exc))
@@ -842,10 +857,10 @@ class App:
                 image_output=payload["image_output"],
                 image_format=payload["image_format"],
             )
-            if result.error:
+            if result.error or result.recoverability == "ERROR":
                 failed += 1
-                entry["errors"].append(result.error)
-                lines.append(f"{name}:  ERROR — {result.error}")
+                entry["errors"].append(result.error or "Redaction error")
+                lines.append(f"{name}:  ERROR — {result.error or 'Redaction error'}")
                 log_entries.append(entry)
                 continue
 
@@ -859,12 +874,17 @@ class App:
                     lines.append(f"    RECOVERABILITY: {result.recoverability} "
                                  f"(leaked={result.recoverability_leaked})")
 
+            ocr_failed = False
             # If OCR enabled, apply OCR redactions on top of the text pass.
             if use_ocr and ext == ".pdf":
                 redacted_pdf = result.outputs[0]
                 try:
                     ocr_plan = ocr.scan_ocr_pdf(redacted_pdf, scan_opts=opts)
-                    if ocr_plan["detections"]:
+                    if ocr_plan.get("warnings"):
+                        ocr_failed = True
+                        entry["errors"].extend(ocr_plan["warnings"])
+                        lines.append(f"  OCR ERROR — {'; '.join(ocr_plan['warnings'])}")
+                    elif ocr_plan["detections"]:
                         temp = redacted_pdf.with_suffix(".ocr_tmp.pdf")
                         ocr.apply_ocr_redactions(redacted_pdf, ocr_plan, temp)
                         temp.replace(redacted_pdf)
@@ -872,22 +892,36 @@ class App:
                         entry["ocr_overlay"] = len(ocr_plan["detections"])
                         lines.append(f"  + {len(ocr_plan['detections'])} OCR overlay redaction(s)")
                 except Exception as exc:  # noqa: BLE001
-                    lines.append(f"  OCR pass skipped — {exc}")
+                    ocr_failed = True
+                    entry["errors"].append(f"OCR overlay failed: {exc}")
+                    lines.append(f"  OCR ERROR — {exc}")
 
-            ok += 1
-            lines.append(f"{name}:  {result.redaction_count} redaction(s) applied")
-            for out in result.outputs:
-                lines.append(f"    → {out}")
-                outputs.append(out)
+            if ocr_failed:
+                failed += 1
+                lines.append(f"{name}:  ERROR — OCR overlay failed for requested OCR file")
+                log_entries.append(entry)
+                continue
 
-            # Verify the primary output immediately.
+            # Verify the primary output immediately (exact final bytes).
             primary = result.outputs[0]
             q.put(("progress", f"Verifying {name}…"))
             v = self._verify_one(primary, opts, use_ocr)
             entry["verify"] = v
             lines.append(f"    VERIFY: {v['status']} (residual={v['residual']})")
-            for w in v["warnings"]:
+            for w in v.get("warnings", []):
                 lines.append(f"      warning: {w}")
+
+            if v["status"] == "PASS":
+                ok += 1
+                lines.append(f"{name}:  {result.redaction_count} redaction(s) applied")
+                for out in result.outputs:
+                    lines.append(f"    → {out}")
+                    outputs.append(out)
+            else:
+                failed += 1
+                entry["errors"].append(f"Verification status: {v['status']}")
+                lines.append(f"{name}:  VERIFY FAILED — {v['status']}")
+
             log_entries.append(entry)
 
         # Persist the batch audit log next to the outputs.

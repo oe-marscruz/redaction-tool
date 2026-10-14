@@ -11,6 +11,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -22,15 +24,48 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-presidio-optional.txt
 
+      - name: PR Scope & Safety Gate
+        run: |
+          python -c "
+          import subprocess, sys, pathlib
+          forbidden_deps = {'requirements.txt', 'requirements-presidio-optional.txt'}
+          binary_exts = {'.dll', '.exe', '.bin', '.whl', '.traineddata', '.so', '.dylib', '.pyd', '.onnx', '.safetensors'}
+          print('=== PR Scope & Changed Path Check ===')
+          res = subprocess.run(['git', 'diff', '--name-only', 'origin/main...HEAD'], capture_output=True, text=True)
+          changed = [f.strip() for f in res.stdout.splitlines() if f.strip()]
+          if not changed:
+              res2 = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'], capture_output=True, text=True)
+              changed = [f.strip() for f in res2.stdout.splitlines() if f.strip()]
+          print('Changed files:')
+          if changed:
+              for f in changed:
+                  print('  ' + f)
+          else:
+              print('  None')
+          forbidden_mod = [f for f in changed if f in forbidden_deps]
+          if forbidden_mod:
+              print('SAFETY GATE REJECTED: Modified forbidden dependency files:', forbidden_mod)
+              sys.exit(1)
+          forbidden_bin = [f for f in changed if pathlib.Path(f).suffix.lower() in binary_exts or 'vendor/' in f.replace('\\', '/').lower()]
+          if forbidden_bin:
+              print('SAFETY GATE REJECTED: Detected committed model/vendor binary files:', forbidden_bin)
+              sys.exit(1)
+          print('SAFETY GATE PASSED: Dependency files untouched and no committed binaries detected. Note: Path scope checks provide structural path safeguards, not semantic proof against feature creep.')
+          "
+
       - name: Syntax check
         # PowerShell does not expand shell globs, so let Python do it.
         run: |
           python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py')]]"
 
-      - name: Unit + regression tests
+      - name: Unit + regression + security tests
         run: |
           python tests/test_core.py
           python tests/test_high_recall.py
+          python tests/test_presidio_integration.py
+          python -m unittest tests/test_document_context.py
+          python -m unittest tests/test_security_verification.py
+          python -m unittest tests/test_end_to_end_presidio.py
 
       - name: Synthetic evaluation corpus
         run: python tests/eval_metrics.py
@@ -41,8 +76,9 @@ jobs:
       - name: Show self-test result
         run: type result.txt
 
-  # Script-compile smoke test only: this compiles installer\RedactionTool.iss
-  # with ISCC against a throwaway placeholder exe. No install is performed.
+  # Builds the real executable and asserts the packaged Presidio and OCR
+  # self-tests pass. A placeholder-exe script-compile smoke test cannot detect
+  # a presidio-less or OCR-less artifact.
   installer-smoke:
     runs-on: windows-latest
     steps:
@@ -60,30 +96,45 @@ jobs:
         run: |
           python -c "import sys; sys.path.insert(0, 'scripts'); import version_file; print('version=' + version_file.read_package_version())" >> $env:GITHUB_OUTPUT
 
-      - name: Create placeholder exe
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          [System.IO.File]::WriteAllBytes("dist\RedactionTool.exe", (New-Object byte[] 4096))
+      - name: Verify build script model hash pin
+        # build_windows.ps1 compares Get-FileHash output (always 64 hex chars)
+        # against its pinned constant. A constant of any other length makes the
+        # real build throw, so fail here instead of in the release build.
+        run: python scripts/check_model_pin.py
 
-      - name: Compile installer (smoke test)
+      - name: Build real executable
+        # build_windows.ps1 creates its own .venv, installs both requirement
+        # sets plus PyInstaller, downloads and hash-verifies the spaCy model
+        # wheel, and stages the model, so this job installs no dependencies
+        # itself. Script-compile smoke testing against a placeholder exe cannot
+        # detect a presidio-less build, so exercise the real build instead.
         run: |
-          $iscc = @(
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
-          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-          if (-not $iscc) {
-            $onPath = Get-Command iscc -ErrorAction SilentlyContinue
-            if ($onPath) { $iscc = $onPath.Source }
+          $ErrorActionPreference = "Stop"
+          $tesseract = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path (Join-Path $tesseract "tesseract.exe"))) {
+            Write-Error "Tesseract not found at '$tesseract'"; exit 1
           }
-          if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
-          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer\RedactionTool.iss
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          Get-ChildItem installer\Output
+          .\build_windows.ps1 -TesseractDir $tesseract
+          # Throws surface as non-terminating by default in some hosts, so
+          # assert the real outputs rather than trusting the exit code alone.
+          if (-not (Test-Path "dist\RedactionTool.exe")) {
+            Write-Error "dist\RedactionTool.exe was not produced"; exit 1
+          }
+          if (-not (Test-Path "exe_selftest.txt")) {
+            Write-Error "exe_selftest.txt was not produced"; exit 1
+          }
 
-      - name: Remove placeholder exe
-        if: always()
-        run: Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+      - name: Verify packaged Presidio and OCR self-test
+        # build_windows.ps1 already throws on either failure; re-assert here so
+        # the job fails loudly if that guard is ever loosened or skipped.
+        run: |
+          if (-not (Test-Path exe_selftest.txt)) {
+            Write-Error "exe_selftest.txt was not produced by the build"; exit 1
+          }
+          $report = Get-Content exe_selftest.txt -Raw
+          Write-Host $report
+          if ($report -notmatch "PASS bundled OCR") { Write-Error "Packaged self-test did not report PASS bundled OCR"; exit 1 }
+          if ($report -notmatch "PASS bundled Presidio") { Write-Error "Packaged self-test did not report PASS bundled Presidio"; exit 1 }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
