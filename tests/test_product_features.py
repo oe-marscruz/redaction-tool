@@ -69,13 +69,45 @@ class DetectionPrecisionTests(unittest.TestCase):
         invalid = detect("Reference 4532 0151 1283 0367 not a card.")
         self.assertEqual(_texts(invalid, "financial"), [])
 
-    def test_bare_zip_needs_zip_context(self):
-        self.assertEqual(detect("Item catalog # 55432 is currently in stock."),
-                         [])
-        contextual = detect("Mailing ZIP 80203 is on the form.")
-        self.assertIn("80203", _texts(contextual, "addresses"))
+    def test_bare_zip_is_redacted_in_every_position(self):
+        # Recall-first: a standalone 5-digit token is redacted even when no
+        # "ZIP"/"postal" label or "City, ST" precedes it.  Over-redacting a
+        # catalog number is acceptable; leaking a ZIP is not.
+        roster = detect("Varga, Per | 00732836 | 06/07/1995 | 720-625-5156 | 69364")
+        self.assertIn("69364", _texts(roster, "addresses"))
+        self.assertIn("Varga, Per", _texts(roster, "names"))
+
+        full_state = detect(
+            "mailed to 4629 Alameda Way, Wichita, Kansas 11142.")
+        self.assertIn("11142", _texts(full_state, "addresses"))
+
+        labeled = detect("Mailing ZIP 80203 is on the form.")
+        self.assertIn("80203", _texts(labeled, "addresses"))
         city_state = detect("Denver, CO 80203")
         self.assertIn("80203", _texts(city_state, "addresses"))
+        self.assertIn("55432",
+                      _texts(detect("Item catalog # 55432 is currently in stock."),
+                             "addresses"))
+
+    def test_given_names_that_look_like_identifier_words(self):
+        # Words added to the name stop list for identifier labels are real
+        # given names in a name position and must still be redacted.
+        for text, expected in (
+            ("Name: Per Varga", "Per Varga"),
+            ("Per Varga attended the hearing.", "Per Varga"),
+            ("Employee: Card Michael", "Card Michael"),
+            ("Name: Visa Anan", "Visa Anan"),
+        ):
+            self.assertIn(expected, _texts(detect(text), "names"), text)
+
+        roster = detect("Varga, Per | 00732836 | 720-625-5156 | 69364")
+        self.assertIn("Varga, Per", _texts(roster, "names"))
+
+    def test_street_address_zip_with_unit_and_full_state(self):
+        matches = detect(
+            "I live at 7471 Kestrel Avenue, Ste. 4, Denver, Colorado 93514.")
+        self.assertIn("7471 Kestrel Avenue, Ste. 4", _texts(matches, "addresses"))
+        self.assertIn("93514", _texts(matches, "addresses"))
 
     def test_quoted_alias_surname_detected(self):
         matches = detect("Alias: \u201cFrankie\u201d DiMartino.")

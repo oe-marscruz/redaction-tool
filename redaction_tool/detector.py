@@ -696,29 +696,6 @@ def _map_norm_span(index: list[int], start: int, end: int, orig_len: int) -> tup
     return _normalize.map_span(index, start, end, orig_len)
 
 
-_US_STATE_CODES = frozenset(part for part in _US_STATES.replace("\\", "").split("|")
-                            if len(part) == 2)
-_BARE_ZIP_RE = re.compile(r"\d{5}")
-
-
-def _bare_zip_without_context(text: str, m: Match) -> bool:
-    """True for a bare 5-digit ZIP that has no ZIP cue around it.
-
-    Five-digit runs are also catalog numbers, amounts, and IDs, so a bare
-    match is only treated as a ZIP when it is labeled ("ZIP 80203"), follows
-    "City, ST", or carries a ZIP+4 suffix.  Contextual ZIPs are unaffected.
-    """
-    if not _BARE_ZIP_RE.fullmatch(m.text.strip()):
-        return False
-    prefix = text[max(0, m.start - 40):m.start]
-    if re.search(r"(?i:zip(?:\s*code)?|postal(?:\s*code)?)\s*[:#]?\s*$", prefix):
-        return False
-    tail = re.search(r",\s*([A-Z]{2})\s*$", prefix)
-    if tail and tail.group(1) in _US_STATE_CODES:
-        return False
-    return True
-
-
 # Presidio is an optional in-process supplement. Explicitly configure the
 # small English model rather than relying on Presidio's larger default model.
 _PRESIDIO_ENTITY_MAP = {
@@ -905,9 +882,11 @@ def _trim_name_match(start: int, end: int, val: str, orig: str, evidence: str = 
             return 0, 0, ""
 
     words = val.split()
+    trailing_junk = (_names._LAST_STOP | _names._FIRST_STOP
+                     | _names._CONJUNCTION | _VERBS)
     while len(words) >= 2:
         last = words[-1].lower().strip(".,;:")
-        if last in _names._LAST_STOP or last in _names._FIRST_STOP or last in _VERBS:
+        if last in trailing_junk:
             words.pop()
             val = " ".join(words)
         else:
@@ -1099,9 +1078,6 @@ def detect(text: str,
             add_orig(m.start(), m.end(), "custom", "custom_literal", CONFIRMED)
 
     # PASS 7 — overlap resolution
-    if "addresses" in enabled:
-        matches = [m for m in matches
-                   if not (m.category == "addresses" and _bare_zip_without_context(orig, m))]
     return _dedupe(matches, orig)
 
 

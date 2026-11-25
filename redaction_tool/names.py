@@ -35,14 +35,19 @@ _FIRST_STOP = frozenset({
     "dr", "mr", "mrs", "ms", "miss", "prof", "professor", "mx",
     "dear", "hello", "hi", "hey", "thanks", "thank", "sincerely", "regards",
     "best", "warm", "cheers", "from", "subject", "sent", "attention",
-    # Conjunctions: honorific/ledger patterns can swallow "Ms. Montoya and".
-    "and", "or", "but", "nor", "yet", "so", "vs", "per", "via", "at", "to",
-    # Identifier labels that otherwise read as title-case name bigrams
-    # ("US Passport No", "Taxpayer ITIN").
-    "us", "usa", "passport", "itin", "ein", "taxpayer", "visa", "mastercard",
-    "amex", "card", "payment", "catalog", "inventory", "invoice", "receipt",
-    "sku", "upc", "routing", "iban", "transaction", "claim", "docket",
-    "reference", "ref", "permit", "badge", "barcode", "serial", "policy",
+})
+
+# Conjunctions are not evidence of a person on their own.  In unlabelled
+# prose the name patterns read "Ms. Montoya and Alexandria" as a chain of
+# names, and the honorific pattern swallows the trailing "and".  Everything
+# else the old identifier-label stop words covered ("US Passport No",
+# "Taxpayer ITIN", "Student Name") is already rejected structurally by
+# ``_LAST_STOP``, which can never contain a real surname.  Given names that
+# collide with identifier nouns ("Per", "Card", "Visa", "Serial") are
+# deliberately absent: blocking them leaked those names, and "First Last" is
+# exactly the shape of a real name.
+_CONJUNCTION = frozenset({
+    "and", "or", "but", "nor", "yet", "vs", "via", "at", "to",
 })
 
 # Last-token words that indicate a place, date, or document artifact.
@@ -60,7 +65,8 @@ _LAST_STOP = frozenset({
     "llc", "inc", "corp", "ltd", "company", "center", "centre", "institute",
     "district", "division", "unit", "team", "committee", "board",
     "edu", "com", "org", "net", "gov",
-    # Identifier labels that otherwise read as a surname token.
+    # Identifier labels are never the final token of a person name; keeping
+    # them here stops a form header ("Student Name") being read as a name.
     "no", "num", "itin", "ein", "passport", "ref", "reference", "sku", "upc",
     "invoice", "receipt", "routing", "iban", "transaction", "catalog",
     "docket", "claim", "badge", "barcode", "name",
@@ -190,6 +196,10 @@ _CONTEXT_FIRST_RE = _c(
     rf"\b({_TOKEN})\s+(?i:{_PERSON_VERB})\b"
 )
 
+# A person verb directly after an otherwise weak "First Last" pair, e.g.
+# "Per Varga attended ..." — the sentence, not the token, is the evidence.
+_VERB_AFTER_RE = _c(rf"\s+(?i:{_PERSON_VERB})\b")
+
 # Possessive first+last already in _FULL_RE; standalone "Maria's" is handled
 # by ledger / unambiguous first names in detector.
 
@@ -208,11 +218,14 @@ _QUOTED_ALIAS_RE = _c(
 )
 
 
-def _ok_first(token: str) -> bool:
+def _ok_first(token: str, weak: bool = False) -> bool:
     t = token.strip(".,;:").replace("'s", "")
     if not t:
         return False
-    return t.lower().strip(".") not in _FIRST_STOP
+    key = t.lower().strip(".")
+    if key in _FIRST_STOP:
+        return False
+    return not (weak and key in _CONJUNCTION)
 
 
 def _ok_last(token: str) -> bool:
@@ -238,11 +251,18 @@ def _split_name(text: str) -> tuple[str, str]:
     return parts[0], parts[-1]
 
 
-def _keep_full(span: str) -> bool:
+def _keep_full(span: str, weak_bigram: bool = False) -> bool:
+    """True when *span* can be a full name.
+
+    ``weak_bigram`` marks the unlabelled "First Last" path, where a token that
+    is only weak name evidence on its own is rejected.  Labelled, honorific,
+    role and "Last, First" callers leave it off: there the position itself is
+    the evidence.
+    """
     first, last = _split_name(span)
     if not first or not last:
         return False
-    if not _ok_first(first.rstrip(".")):
+    if not _ok_first(first.rstrip("."), weak=weak_bigram):
         return False
     if not _ok_last(last.rstrip(".")):
         return False
@@ -332,8 +352,15 @@ def detect_names(text: str) -> list[tuple[int, int, str, str]]:
         if _ok_last(last):
             add(m, "initial_last")
     for m in _FULL_RE.finditer(text):
-        if _keep_full(m.group()):
-            add(m, "titlecase")
+        span = m.group()
+        if not _keep_full(span):
+            continue
+        # A weak-only first token ("Per Varga") is admitted when a person verb
+        # follows, because then the position is proven by the sentence.
+        if (not _keep_full(span, weak_bigram=True)
+                and not _VERB_AFTER_RE.match(text, m.end())):
+            continue
+        add(m, "titlecase")
     for m in _APPOSITIVE_RE.finditer(text):
         add(m, "appositive", group=1)
     for m in _QUOTED_ALIAS_RE.finditer(text):
@@ -343,7 +370,7 @@ def detect_names(text: str) -> list[tuple[int, int, str, str]]:
             hits.append((s, s + len(val), val, "alias_surname"))
     for m in _CONTEXT_FIRST_RE.finditer(text):
         token = m.group(1)
-        if _ok_first(token) and token.lower() not in _LAST_STOP:
+        if _ok_first(token, weak=True) and token.lower() not in _LAST_STOP:
             hits.append((m.start(1), m.end(1), token, "context_first"))
 
     return hits

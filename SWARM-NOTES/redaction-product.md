@@ -105,3 +105,22 @@ Metrics (Presidio run / baseline identical strict scores):
 | Presidio A/B | PASS (recall equal, precision −0.0057) | PASS |
 
 Synthetic-corpus score is not a production claim; corpus is 334 docs / 345 gold spans.
+
+## 6. Post-merge correction (redaction-integrate lane)
+
+An independent held-out evaluation (350 docs / 5404 gold spans, unseen names and templates) found
+two recall regressions in the delivered detector, confirmed against the pristine baseline:
+
+| Regression | Spans | Cause | Fix |
+|---|---|---|---|
+| Bare ZIPs dropped outside `ZIP`/`, ST` context | 173 | `_bare_zip_without_context` gate | Gate removed: any 5-digit token is a ZIP (roster cells, `City, FullState ZIP`, standalone). |
+| Given names dropped when they collide with identifier words | 12 | `per`, `card`, `visa`, `serial`, ... added to `_FIRST_STOP` | Identifier nouns removed from the first-token stop list; only conjunctions stay blocked in the unlabelled `First Last` path, and `_LAST_STOP` still rejects `US Passport No` / `Taxpayer ITIN` structurally. |
+
+Result on the held-out corpora (baseline-vs-candidate character coverage): leak regressions
+185 → 0 (no Presidio) and 187 → 2 (Presidio; both are the leading `+` of a `+1` phone, explained
+below). The tuned corpus drops from strict P/R/F1 `1.0/1.0/1.0` to `0.9971/1.0000/0.9986`
+because `Item catalog # 55432` is now redacted as a ZIP — an intentional over-redaction.
+The two remaining Presidio leaks are the `+` sign of `+1 520-778-2093` / `+1 303-507-6896`:
+the phone regex starts at the leading `1` because `\b` cannot match before `+`; the baseline
+"covered" the `+` only through a bogus name span (`...k12.us | +`) that the candidate correctly
+drops. No identifier characters are left in either case.

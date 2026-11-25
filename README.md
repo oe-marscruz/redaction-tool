@@ -91,7 +91,7 @@ Detection categories are based on the
 | Category | HIPAA # | Notes |
 |---|---|---|
 | Names | 1 | Honorifics ("Dr. Jane Smith"), built-in list of 500+ common first names ("First Last", "Last, First", standalone first names), email-closing words excluded. |
-| Addresses / ZIP / City, State | 2 | Street addresses (including apt/suite), PO boxes, city + state, ZIP+4, and 5-digit ZIPs when a ZIP label or "City, ST" precedes them. |
+| Addresses / ZIP / City, State | 2 | Street addresses (including apt/suite), PO boxes, city + state, ZIP+4, and 5-digit ZIPs in any position — labeled, after a state name, in a table cell, or standalone. |
 | Dates | 3 | All date formats + ages over 89. |
 | Phone numbers | 4 | US formats incl. +1 prefix. |
 | Fax numbers | 5 | Contextual ("Fax: …"). |
@@ -398,11 +398,16 @@ gate as the deterministic name detector, so model noise such as a ratio
 
 **Detection quality.** The synthetic corpus (`tests/eval_corpus.py`, 334
 documents / 345 gold spans) is scored by `python tests/eval_metrics.py`:
-strict category-correct P/R/F1 `1.0000/1.0000/1.0000`, exact-span P/R
-`0.8725`, character coverage P/R `0.9656/0.9943`, and the optional-Presidio
-A/B gate PASSes (recall unchanged, precision within its 2% budget). These are
-synthetic fixtures, not production recall claims. Two behaviours keep the
-counts honest and the redaction coverage identical:
+strict category-correct P/R/F1 `0.9971/1.0000/0.9986`, exact-span P/R
+`0.8699/0.8725`, character coverage P/R `0.9646/0.9943`, and the
+optional-Presidio A/B gate PASSes (recall unchanged, precision within its 2%
+budget). These are synthetic fixtures, not production recall claims. The one
+remaining false positive is the corpus's `Item catalog # 55432` line: a bare
+5-digit token is always treated as a ZIP, because the alternative — requiring
+a `ZIP` label or `City, ST` in front — leaked 173 real ZIPs from roster cells
+and full-state-name addresses in an independent held-out evaluation. A
+redacted catalog number is harmless; a redacted ZIP is not. Two behaviours
+keep the counts honest and the redaction coverage identical:
 
 - Overlapping detections of the *same* category (a name plus its possessive
   fragment, a PO box plus its ZIP) become one union span, so the same
