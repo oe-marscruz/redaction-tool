@@ -126,7 +126,7 @@ the shared CI gate replaces an inline duplicate.
 Environment: Arch Linux; `uv venv -p 3.13` (CPython 3.13.14, Tcl/Tk 9.0);
 Tesseract 5.5.4 at `/usr/bin/tesseract` with `/usr/share/tessdata`.
 
-- `.python tests/test_core.py` → `RESULT: ALL PASS` (was `FAIL` before:
+- `.venv/bin/python tests/test_core.py` → `RESULT: ALL PASS` (was `FAIL` before:
   `test_image_round_trip` could not find `eng.traineddata`)
 - `.venv/bin/python tests/test_high_recall.py` → `ALL PASS`
 - `.venv/bin/python tests/test_presidio_integration.py` → `ALL PASS`
