@@ -90,8 +90,9 @@ Items 1–4. Tests: `tests/test_product_features.py` (synthetic fixtures only). 
 | Presidio PERSON/LOCATION credibility gate | `redaction_tool/detector.py` (`_presidio_matches`) |
 | Batch-scoped pseudonym labels in DOCX/XLSX/PDF/OCR overlay | `redaction_tool/pseudonyms.py`, `redactor.py`, `ocr.py`, `gui.py` |
 | Per-location audit + Markdown report, no plaintext | `redaction_tool/audit.py`, `redactor.py`, `gui.py` |
+| Verification cannot mint pseudonym labels | `redaction_tool/verify.py` |
 | Folder intake in GUI | `redaction_tool/gui.py` |
-| Tests | `tests/test_product_features.py` (18 cases) |
+| Tests | `tests/test_product_features.py` (19 cases) |
 
 Metrics (Presidio run / baseline identical strict scores):
 
