@@ -15,7 +15,7 @@ Detection categories are based on the
 | Category | HIPAA # | Notes |
 |---|---|---|
 | Names | 1 | Honorifics ("Dr. Jane Smith"), built-in list of 500+ common first names ("First Last", "Last, First", standalone first names), email-closing words excluded. |
-| Addresses / ZIP / City, State | 2 | Street addresses, PO boxes, ZIP/ZIP+4, city + state, apt/suite numbers. |
+| Addresses / ZIP / City, State | 2 | Street addresses (including apt/suite), PO boxes, city + state, ZIP+4, and 5-digit ZIPs when a ZIP label or "City, ST" precedes them. |
 | Dates | 3 | All date formats + ages over 89. |
 | Phone numbers | 4 | US formats incl. +1 prefix. |
 | Fax numbers | 5 | Contextual ("Fax: …"). |
@@ -32,7 +32,7 @@ Detection categories are based on the
 | Biometric references | 16 | Text references only. |
 | Unique IDs | 18 | Student/Employee/Case/File numbers, bare 7–10 digit identifiers. |
 | Student records (FERPA) | — | GPA, grades. |
-| Financial info (FERPA/GLBA) | — | Tuition, aid, salary, etc. with $ amounts. |
+| Financial info (FERPA/GLBA) | — | Tuition, aid, salary, etc. with $ amounts; payment card numbers (13–19 digits, Luhn-checked). |
 
 **HIPAA #17 (full-face photos) cannot be auto-detected.** Review PDFs
 manually; the tool leaves embedded images intact.
@@ -51,6 +51,39 @@ For known subjects (e.g. case respondents), paste their full names into the
 **Extra literal texts** box — one per line. This is the most reliable way to
 catch every occurrence, including nicknames. Advanced users can add regex
 patterns, one per line.
+
+**Adding many documents**: *Add Files…* takes a multi-selection, *Add
+Folder…* queues every supported file in a folder and its subfolders
+(PDF/DOCX/XLSX and images), and drag & drop works too. Article
+`~$` lock files are skipped.
+
+## Consistent pseudonym labels (qualitative coding)
+
+Replacing everything with `[REDACTED]` protects a corpus but makes it hard to
+follow one person or one account through a case file. Tick **Pseudonym
+labels** to replace each detected value with a stable typed label instead:
+
+```
+before:  Alexandria Montoya (SSN 123-45-6789) called 303-555-0142.
+after:   [NAME_1] ([SSN_1]) called [PHONE_1].
+```
+
+- The same value gets the same label for the whole batch (pass several case
+  files in one run and `[NAME_1]` is the same person in each).
+- Different values of a category get the next number (`[NAME_2]`,
+  `[EMAIL_1]`, …), so coding can refer to "the subject" without the name.
+- Labels are written into DOCX/XLSX text, PDF text, and OCR overlays. They
+  are labels, not reversible tokens: **the value→label map exists only in
+  memory and is never written to disk**, so a label cannot be turned back
+  into the identifier. Keep your own mapping outside the redacted corpus if
+  you need one.
+- Category tags: `NAME, ADDRESS, DATE, PHONE, FAX, EMAIL, SSN, MRN,
+  HEALTHPLAN, ACCOUNT, LICENSE, VEHICLE, DEVICE, URL, IP, BIOMETRIC, ID,
+  STUDENTRECORD, FINANCIAL, CUSTOM`.
+- Header-driven XLSX columns use the cell value itself, so repeated values in
+  a roster share a label.
+- OCR overlay boxes on standalone images stay opaque black (no label is drawn
+  into pixels).
 
 ## How redaction works
 
@@ -222,8 +255,17 @@ low-confidence results surfaced as warnings.
   cannot be recovered. If any survive, the result is marked `NEEDS_REVIEW`,
   never `PASS`. A missing/empty output is treated as an error.
 - **Audit log**: each batch writes `redaction_log_<timestamp>.json` next
-  to the outputs — source file, preset, per-category counts, verify
-  result, and timestamp for every entry.
+  to the outputs — source file, preset, replacement mode, and for every
+  document the per-category counts, the verify result, and an `audit` list of
+  locations: which page / sheet cell / paragraph / header / footnote / form
+  field was touched and with which categories. Structural labels only — no
+  source text, no values.
+- **Human-readable report**: the same batch also writes
+  `redaction_report_<timestamp>.md` — a Markdown summary with document
+  status (PASS / NEEDS_REVIEW), recoverability result, category totals, a
+  "where" table per document, and a **Follow-up required** list for anything
+  that failed. Safe to share when reviewing a redaction run: it contains no
+  identifiers.
 - **Redaction plans**: OCR-processed files also save a detailed
   `<name>_plan.json` with bounding boxes and masked previews.
 - **Salted fingerprints**: plan fingerprints use a random per-batch salt
@@ -252,7 +294,24 @@ when installed and can be unchecked in the UI. Install it for source runs with
 `pip install -r requirements-presidio-optional.txt`; the Windows release build
 bundles Presidio and its English model. The tool never starts a Presidio server.
 The statistical model can produce false positives and false negatives; review
-detections before redacting.
+detections before redacting. Its output is subject to the same credibility
+gate as the deterministic name detector, so model noise such as a ratio
+(`Ratio 5/97`) or a header (`Email`) is not reported as a person.
+
+**Detection quality.** The synthetic corpus (`tests/eval_corpus.py`, 334
+documents / 345 gold spans) is scored by `python tests/eval_metrics.py`:
+strict category-correct P/R/F1 `1.0000/1.0000/1.0000`, exact-span P/R
+`0.8725`, character coverage P/R `0.9656/0.9943`, and the optional-Presidio
+A/B gate PASSes (recall unchanged, precision within its 2% budget). These are
+synthetic fixtures, not production recall claims. Two behaviours keep the
+counts honest and the redaction coverage identical:
+
+- Overlapping detections of the *same* category (a name plus its possessive
+  fragment, a PO box plus its ZIP) become one union span, so the same
+  characters are not counted twice.
+- A detection fully contained in another category's span (a phone number
+  inside `Fax: …`, a name inside an email address) is reported once, under
+  the containing category; explicit *Extra literal texts* are never dropped.
 
 ## Project layout
 
@@ -264,6 +323,8 @@ detections before redacting.
 - `redaction_tool/normalize.py` — NFKC / hyphen-join / OCR-tolerant normalization with offset mapping
 - `redaction_tool/taxonomy.py` — canonical FERPA/HIPAA entity taxonomy + coverage map
 - `redaction_tool/verify.py` — post-export recoverability (fail-closed)
+- `redaction_tool/audit.py` — per-location audit trail + Markdown batch report
+- `redaction_tool/pseudonyms.py` — batch-scoped typed labels (`[NAME_1]`), in-memory only
 - `redaction_tool/redactor.py` — per-format redaction engines + image output
 - `redaction_tool/presets.py` — custom preset save/load/delete (JSON)
 - `redaction_tool/gui.py` — Tkinter desktop app (drag & drop via tkinterdnd2)
@@ -271,7 +332,8 @@ detections before redacting.
 - `references/` — methodology, plan schema, entity policy docs
 - `templates/`, `examples/` — sample redaction plan files
 - `SKILL.md` — Hermes/Bionic AI agent skill definition
-- `tests/` — unit tests, high-recall tests, synthetic eval corpus + metrics
+- `tests/` — unit tests, high-recall tests, product-feature tests
+  (`test_product_features.py`), synthetic eval corpus + metrics
 - `RedactionTool.spec` — PyInstaller one-file build config
 - `Run-RedactionTool.bat` — double-click launcher (exe, or auto-installs
   deps and runs from source)
