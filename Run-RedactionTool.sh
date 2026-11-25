@@ -67,13 +67,20 @@ DESKTOP
 }
 
 find_python() {
+    local fallback=""
     for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
-        if command -v "$candidate" >/dev/null 2>&1 &&
-           "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null || continue
+        if "$candidate" -c 'import tkinter' 2>/dev/null; then
             printf '%s\n' "$candidate"
             return 0
         fi
+        : "${fallback:=$candidate}"
     done
+    if [ -n "$fallback" ]; then
+        printf '%s\n' "$fallback"
+        return 0
+    fi
     return 1
 }
 
@@ -121,9 +128,11 @@ if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
 fi
 
 if ! "$VENV_PY" -c 'import tkinter' 2>/dev/null; then
-    fail "This Python has no tkinter. On Debian/Ubuntu:
-    sudo apt install python3-tk
-  (then delete .venv and run this script again)"
+    fail "This Python has no tkinter ('$PYTHON'). Install the Tk bindings and retry:
+    Debian/Ubuntu: sudo apt install python3-tk
+    Fedora:        sudo dnf install python3-tkinter
+    Arch:          sudo pacman -S tk
+  Then delete .venv and run this script again."
 fi
 
 if ! "$VENV_PY" -c 'import pymupdf, docx, openpyxl, tkinterdnd2' 2>/dev/null; then
