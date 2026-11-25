@@ -24,6 +24,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import detector, ocr, presets, redactor
+from .audit import RedactionAudit, write_batch_artifacts
+from .pseudonyms import Pseudonymizer
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -254,8 +256,10 @@ class App:
         btn_row = tk.Frame(files_frame, bg=t["bg"])
         btn_row.pack(fill="x")
         self._button(btn_row, "Add Files…", self.add_files, "accent").pack(side="left")
-        self._button(btn_row, "Remove Selected", self.remove_selected, "gray").pack(
+        self._button(btn_row, "Add Folder…", self.add_folder, "accent").pack(
             side="left", padx=8)
+        self._button(btn_row, "Remove Selected", self.remove_selected, "gray").pack(
+            side="left")
         self._button(btn_row, "Clear All", self.clear_files, "gray").pack(side="left")
         hint_text = "or drag & drop files here" if _DND_OK else "(drag & drop unavailable)"
         hint = tk.Label(btn_row, text=hint_text, font=("Segoe UI", 9, "italic"),
@@ -379,14 +383,29 @@ class App:
 
         img_row = tk.Frame(out_frame, bg=t["bg"])
         img_row.pack(fill="x", pady=(4, 0))
+        self.pseudonym_var = tk.BooleanVar(value=False)
+        self.pseudonym_cb = tk.Checkbutton(
+            img_row,
+            text="Pseudonym labels ([NAME_1], [EMAIL_1] … consistent per batch)",
+            variable=self.pseudonym_var, font=("Segoe UI", 10),
+            bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+            activeforeground=t["fg"], selectcolor=t["surface"])
+        self.pseudonym_cb.pack(side="left")
+        tk.Label(img_row,
+                 text="replaces the constant replacement text; the value→label map is never saved",
+                 font=("Segoe UI", 8, "italic"), bg=t["bg"], fg=t["muted"]
+                 ).pack(side="left", padx=10)
+
+        out_row2 = tk.Frame(out_frame, bg=t["bg"])
+        out_row2.pack(fill="x", pady=(4, 0))
         self.image_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(img_row, text="Also render redacted PDFs as images",
+        tk.Checkbutton(out_row2, text="Also render redacted PDFs as images",
                        variable=self.image_var, font=("Segoe UI", 10),
                        bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
                        activeforeground=t["fg"], selectcolor=t["surface"]
                        ).pack(side="left")
         self.image_fmt_var = tk.StringVar(value="PNG")
-        ttk.Combobox(img_row, textvariable=self.image_fmt_var, values=["PNG", "JPEG"],
+        ttk.Combobox(out_row2, textvariable=self.image_fmt_var, values=["PNG", "JPEG"],
                      state="readonly", width=6).pack(side="left", padx=8)
 
         # ── Actions ───────────────────────────────────────────────────────
@@ -475,6 +494,24 @@ class App:
                                             filetypes=FILE_TYPES)
         self._add_paths(list(paths))
 
+    def add_folder(self) -> None:
+        """Queue every supported document under a folder (recursive)."""
+        folder = filedialog.askdirectory(title="Choose a folder of documents")
+        if not folder:
+            return
+        paths = sorted(
+            str(p) for p in Path(folder).rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in redactor.SUPPORTED_EXTENSIONS
+            and not p.name.startswith("~$")
+        )
+        if not paths:
+            messagebox.showinfo("No documents",
+                                "No PDF, DOCX, XLSX or image files found in "
+                                "that folder.")
+            return
+        self._add_paths(paths)
+
     def _add_paths(self, paths: list[str]) -> None:
         added = 0
         for p in paths:
@@ -555,6 +592,7 @@ class App:
             replacement=self.replacement_var.get() or redactor.DEFAULT_REPLACEMENT,
             hash_salt=salt,
             use_presidio=self.presidio_var.get(),
+            pseudonyms=Pseudonymizer() if self.pseudonym_var.get() else None,
         )
 
     def _write_results(self, lines: list[str]) -> None:
@@ -626,6 +664,8 @@ class App:
                 msg += f"\n{done['failed']} file(s) failed — see list above."
             if done.get("log_path"):
                 msg += f"\nAudit log: {done['log_path']}"
+            if done.get("report_path"):
+                msg += f"\nReport: {done['report_path']}"
             self.status.config(text=msg.replace("\n", " "))
             messagebox.showinfo("Redaction complete", msg)
         elif kind == "verify":
@@ -824,6 +864,13 @@ class App:
                     entry["ocr_used"] = True
                     entry["plan"] = {"detections": len(plan["detections"]),
                                      "warnings": plan["warnings"]}
+                    image_audit = RedactionAudit()
+                    for d in plan["detections"]:
+                        image_audit.add(f"page {d.get('page', 1)} (OCR)",
+                                        d["entity_type"])
+                    entry["audit"] = image_audit.as_list()
+                    entry["redaction_count"] = len(plan["detections"])
+                    entry["per_category"] = image_audit.category_totals()
                     try:
                         plan_path = out_path.with_suffix(out_path.suffix + ".plan.json")
                         plan_path.write_text(json.dumps(plan, indent=2),
@@ -867,6 +914,7 @@ class App:
             entry["outputs"] = [str(o) for o in result.outputs]
             entry["redaction_count"] = result.redaction_count
             entry["per_category"] = result.per_category
+            entry["audit"] = result.audit
             if result.recoverability:
                 entry["recoverability"] = result.recoverability
                 entry["recoverability_leaked"] = result.recoverability_leaked
@@ -890,6 +938,11 @@ class App:
                         temp.replace(redacted_pdf)
                         entry["ocr_used"] = True
                         entry["ocr_overlay"] = len(ocr_plan["detections"])
+                        overlay_audit = RedactionAudit()
+                        for d in ocr_plan["detections"]:
+                            overlay_audit.add(f"page {d.get('page', 1)} (OCR)",
+                                              d["entity_type"])
+                        entry.setdefault("audit", []).extend(overlay_audit.as_list())
                         lines.append(f"  + {len(ocr_plan['detections'])} OCR overlay redaction(s)")
                 except Exception as exc:  # noqa: BLE001
                     ocr_failed = True
@@ -924,28 +977,34 @@ class App:
 
             log_entries.append(entry)
 
-        # Persist the batch audit log next to the outputs.
+        # Persist the batch audit log and its human-readable report next to
+        # the outputs.  Both contain categories and locations only.
         log_path = None
+        report_path = None
         if log_entries:
             try:
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 base = Path(out_dir) if out_dir else Path(files[0]).parent
-                log_path = base / f"redaction_log_{stamp}.json"
-                log_path.write_text(json.dumps({
+                batch = {
                     "tool_version": _tool_version(),
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
                     "preset": preset,
                     "hash_salt": opts.hash_salt,
                     "replacement": opts.replacement,
+                    "pseudonymize": opts.pseudonyms is not None,
+                    "use_presidio": opts.use_presidio,
                     "entries": log_entries,
-                }, indent=2), encoding="utf-8")
+                }
+                log_path, report_path = write_batch_artifacts(base, batch)
                 lines.append("")
                 lines.append(f"Audit log: {log_path}")
+                lines.append(f"Report:    {report_path}")
             except Exception:
                 pass
 
         return {"lines": lines, "ok": ok, "failed": failed,
                 "total": len(files), "outputs": outputs,
-                "log_path": str(log_path) if log_path else None}
+                "log_path": str(log_path) if log_path else None,
+                "report_path": str(report_path) if report_path else None}
 
 
 def _tool_version() -> str:

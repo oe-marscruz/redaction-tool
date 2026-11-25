@@ -272,6 +272,11 @@ def detect_on_ocr(words: list[OCRWord],
             "sha256": hashlib.sha256((salt + m.text).encode("utf-8")).hexdigest(),
             "action": "redact",
         }
+        pseudonyms = getattr(opts, "pseudonyms", None)
+        if pseudonyms is not None:
+            # Label only — never the source value.  Kept in the plan so the
+            # overlay pass can render the same [NAME_1] style label.
+            entry["label"] = pseudonyms.label_for(m.category, m.text)
         plan_entries.append(entry)
     return plan_entries, warnings
 
@@ -356,7 +361,15 @@ def apply_pdf_ocr_redactions(pdf_path: Path, plan: dict, out: Path) -> None:
         page = doc[pno - 1]
         for d in entries:
             rect = pymupdf.Rect(*d["bbox"])
-            page.add_redact_annot(rect, fill=(0, 0, 0), cross_out=False)
+            label = d.get("label")
+            if label:
+                size = min(9.0, max(4.0, rect.height * 0.7))
+                size = min(size, max(4.0, rect.width / (len(label) * 0.6)))
+                page.add_redact_annot(rect, text=label, fill=(0, 0, 0),
+                                      text_color=(1, 1, 1), fontsize=size,
+                                      align=1, cross_out=False)
+            else:
+                page.add_redact_annot(rect, fill=(0, 0, 0), cross_out=False)
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS)
     doc.save(str(out), garbage=4, deflate=True)
     doc.close()
