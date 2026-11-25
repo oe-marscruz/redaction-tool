@@ -107,3 +107,58 @@ gated with the exact legacy string; the spec keeps byte-identical asset paths
 and the version resource on Windows; `build_windows.ps1`,
 `Run-RedactionTool.bat` and the `installer-smoke` job are untouched except where
 the shared CI gate replaces an inline duplicate.
+
+## 5. What was implemented (commits on `swarm/platform`)
+
+| Commit | Change | Files |
+|---|---|---|
+| `Add cross-platform user data dir and Linux GUI startup fallback` | `redaction_tool/paths.py` (Windows `%USERPROFILE%\.redaction_tool`, Linux XDG with legacy fallback); GUI root falls back to plain Tk when `tkdnd` cannot load | `redaction_tool/{paths,presets,gui}.py`, `tests/test_platform_paths.py`, `tests/test_gui_smoke.py` |
+| `Find Tesseract and its trained data on Linux` | POSIX bundled binary name, `TESSDATA_PREFIX` both layouts, exe-relative data, `--list-langs` probe, distro data dirs, `configs/tsv`-less fallback via `-c tessedit_create_tsv=1`; portable OCR font in `--selftest` | `redaction_tool/ocr.py`, `run.py` |
+| `Add a Linux launcher with an optional desktop entry` | `Run-RedactionTool.sh` (binary, else venv + deps), `--install-desktop-entry` | `Run-RedactionTool.sh` |
+| `Build a Linux one-file binary from the same spec` | platform-aware spec (POSIX Tesseract name/`.so`, no Windows version resource, optional OCR staging, Tcl/Tk libs, `docx` sources on disk), `build_linux.sh`, BUILDING.md Linux section | `RedactionTool.spec`, `build_linux.sh`, `BUILDING.md` |
+| `Run CI on Ubuntu as well as Windows` | shared `scripts/ci_scope_gate.py`, `test-linux` job (system deps, environment report, suites, headless GUI, launcher), `linux-bundle-smoke` job, `installer-smoke` Tesseract install fix | `.github/workflows/ci.yml`, `scripts/ci_scope_gate.py` |
+| `Document Linux support and make the corpus harness usable` | README Quickstart + settings table + per-OS OCR + build docs; `validate_real_files.py` CLI; `.gitignore` UTF-16 fix; these notes | `README.md`, `validate_real_files.py`, `.gitignore`, `SWARM-NOTES/` |
+| `Prefer a Python that has tkinter in the Linux launcher` | interpreter selection + per-distro hint | `Run-RedactionTool.sh` |
+| `Probe Tesseract for its data directory only when cheap guesses fail` | avoid a subprocess spawn per page | `redaction_tool/ocr.py` |
+
+## 6. Verification on Linux (actual commands)
+
+Environment: Arch Linux; `uv venv -p 3.13` (CPython 3.13.14, Tcl/Tk 9.0);
+Tesseract 5.5.4 at `/usr/bin/tesseract` with `/usr/share/tessdata`.
+
+- `.python tests/test_core.py` → `RESULT: ALL PASS` (was `FAIL` before:
+  `test_image_round_trip` could not find `eng.traineddata`)
+- `.venv/bin/python tests/test_high_recall.py` → `ALL PASS`
+- `.venv/bin/python tests/test_presidio_integration.py` → `ALL PASS`
+- `.venv/bin/python -m unittest tests/test_document_context.py` → 14 OK
+- `.venv/bin/python -m unittest tests/test_security_verification.py` → 15 OK
+- `.venv/bin/python -m unittest tests/test_end_to_end_presidio.py` → 5 OK
+- `.venv/bin/python -m unittest tests/test_platform_paths.py` → 14 OK (new)
+- `xvfb-run -a .venv/bin/python -m unittest tests/test_gui_smoke.py` → 2 OK (new;
+  the app redacts a synthetic DOCX through the real GUI)
+- `.venv/bin/python tests/eval_metrics.py` → exit 0, `A/B Comparison: PASS`
+- `.venv/bin/python run.py --selftest result.txt` → `OK` + all PASS lines
+- `./Run-RedactionTool.sh --selftest launcher_result.txt` → `OK`
+- `./build_linux.sh` → built `dist/RedactionTool`, `exe_selftest.txt` = `OK`
+  incl. `PASS bundled OCR` and `PASS bundled Presidio` (OCR via system Tesseract)
+- `./dist/RedactionTool` under `xvfb-run` → window opens (screenshot captured)
+- `desktop-file-validate ~/.local/share/applications/redaction-tool.desktop` → clean
+- `python validate_real_files.py <3 synthetic files> --must-not-leak ...` →
+  `RESULT: ALL PASS`
+- Clean-checkout test: `git archive HEAD` into a directory whose name contains a
+  space, `./Run-RedactionTool.sh --selftest` → created `.venv`, installed deps,
+  `OK`; the launcher started the GUI from that path.
+
+Not verified here: anything on Windows (no Windows machine). Windows is covered
+by the preserved `windows-latest` jobs, by `os.name`-gated code paths, and by
+`tests/test_platform_paths.py`, which asserts the Windows branch of
+`redaction_tool.paths` from Linux. `installer-smoke` on `main` was already red
+before this work because the runner image stopped shipping Tesseract; that job
+now installs it explicitly.
+
+## 7. Deliberately unchanged
+
+`requirements*.txt`, committed binaries, `build_windows.ps1`,
+`Run-RedactionTool.bat`, `installer/*.iss`, detection heuristics, presets
+content, GUI layout/theme. The app version stays `1.2.0`; bumping it is a
+release decision for the lane lead.
