@@ -137,6 +137,18 @@ def _tessdata_dir_from_tesseract(executable: Optional[str]) -> Optional[Path]:
     return None
 
 
+def _tessdata_choice(dirs, english_only: Optional[Path]):
+    """Return the first usable directory, preferring one with the TSV config."""
+    for candidate in dirs:
+        if not candidate or not (candidate / "eng.traineddata").is_file():
+            continue
+        if (candidate / "configs" / "tsv").is_file():
+            return candidate, english_only
+        if english_only is None:
+            english_only = candidate
+    return None, english_only
+
+
 def find_tessdata(tesseract_cmd: Optional[str] = None) -> Optional[Path]:
     """Find the English trained-data folder for the bundled or system Tesseract.
 
@@ -157,20 +169,17 @@ def find_tessdata(tesseract_cmd: Optional[str] = None) -> Optional[Path]:
     if executable:
         candidates.extend((Path(executable).parent / "tessdata",
                            Path(executable).resolve().parent / "tessdata"))
-    probed = _tessdata_dir_from_tesseract(executable)
-    if probed:
-        candidates.append(probed)
-    candidates.extend(Path(p) for p in TESSDATA_DIRS)
 
-    english_only = None
-    for candidate in candidates:
-        if not candidate or not (candidate / "eng.traineddata").is_file():
-            continue
-        if (candidate / "configs" / "tsv").is_file():
-            return candidate
-        if english_only is None:
-            english_only = candidate
-    return english_only
+    found, english_only = _tessdata_choice(candidates, None)
+    if found:
+        return found
+
+    # Only ask the binary when the cheap guesses failed: probing costs a
+    # subprocess spawn and a page-by-page OCR run should not pay it.
+    probed = _tessdata_dir_from_tesseract(executable)
+    fallback = ([probed] if probed else []) + [Path(p) for p in TESSDATA_DIRS]
+    found, english_only = _tessdata_choice(fallback, english_only)
+    return found or english_only
 
 
 def check_dependencies() -> dict:
