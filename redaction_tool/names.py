@@ -35,6 +35,14 @@ _FIRST_STOP = frozenset({
     "dr", "mr", "mrs", "ms", "miss", "prof", "professor", "mx",
     "dear", "hello", "hi", "hey", "thanks", "thank", "sincerely", "regards",
     "best", "warm", "cheers", "from", "subject", "sent", "attention",
+    # Conjunctions: honorific/ledger patterns can swallow "Ms. Montoya and".
+    "and", "or", "but", "nor", "yet", "so", "vs", "per", "via", "at", "to",
+    # Identifier labels that otherwise read as title-case name bigrams
+    # ("US Passport No", "Taxpayer ITIN").
+    "us", "usa", "passport", "itin", "ein", "taxpayer", "visa", "mastercard",
+    "amex", "card", "payment", "catalog", "inventory", "invoice", "receipt",
+    "sku", "upc", "routing", "iban", "transaction", "claim", "docket",
+    "reference", "ref", "permit", "badge", "barcode", "serial", "policy",
 })
 
 # Last-token words that indicate a place, date, or document artifact.
@@ -52,6 +60,10 @@ _LAST_STOP = frozenset({
     "llc", "inc", "corp", "ltd", "company", "center", "centre", "institute",
     "district", "division", "unit", "team", "committee", "board",
     "edu", "com", "org", "net", "gov",
+    # Identifier labels that otherwise read as a surname token.
+    "no", "num", "itin", "ein", "passport", "ref", "reference", "sku", "upc",
+    "invoice", "receipt", "routing", "iban", "transaction", "catalog",
+    "docket", "claim", "badge", "barcode", "name",
 })
 
 # Lowercase particles that appear inside compound surnames.
@@ -188,6 +200,13 @@ _APPOSITIVE_RE = _c(
     re.IGNORECASE,
 )
 
+# Alias: “Frankie” DiMartino  →  the quoted nickname plus the surname that
+# follows it belongs to the same person record.
+_QUOTED_ALIAS_RE = _c(
+    rf"\b(?i:Alias|AKA|A\.K\.A|Nickname|Goes\s+by)\s*[:\-–—]\s*"
+    rf"['\"“”‘’]{_TOKEN}['\"“”‘’]\s+(?P<surname>{_TOKEN})\b"
+)
+
 
 def _ok_first(token: str) -> bool:
     t = token.strip(".,;:").replace("'s", "")
@@ -317,6 +336,11 @@ def detect_names(text: str) -> list[tuple[int, int, str, str]]:
             add(m, "titlecase")
     for m in _APPOSITIVE_RE.finditer(text):
         add(m, "appositive", group=1)
+    for m in _QUOTED_ALIAS_RE.finditer(text):
+        s, e = m.start("surname"), m.end("surname")
+        val = m.group("surname").strip(".,;:")
+        if _ok_last(val) and val:
+            hits.append((s, s + len(val), val, "alias_surname"))
     for m in _CONTEXT_FIRST_RE.finditer(text):
         token = m.group(1)
         if _ok_first(token) and token.lower() not in _LAST_STOP:
