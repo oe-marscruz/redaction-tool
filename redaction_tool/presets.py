@@ -9,10 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from . import paths
 from .detector import CATEGORIES, CATEGORY_MAP, PRESETS
-
-# Path for user presets (stored next to the tool or in user config)
-_PRESETS_DIR = Path.home() / ".redaction_tool" / "presets"
 
 
 def _ensure_dir() -> None:
@@ -20,7 +18,8 @@ def _ensure_dir() -> None:
 
 
 def _presets_dir() -> Path:
-    return _PRESETS_DIR
+    """User preset folder (per-OS location, see :mod:`redaction_tool.paths`)."""
+    return paths.presets_dir()
 
 
 def _preset_path(name: str) -> Path:

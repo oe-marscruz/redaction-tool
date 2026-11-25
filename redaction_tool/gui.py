@@ -8,7 +8,7 @@ Workflow:
   4. Redact — writes permanent redacted copies (never touches originals).
 
 Supports light and dark themes (toggle in the header; choice is remembered
-in ~/.redaction_tool/settings.json).
+in the per-user settings file, see :mod:`redaction_tool.paths`).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import detector, ocr, presets, redactor
+from . import detector, ocr, paths, presets, redactor
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -76,7 +76,7 @@ THEMES: dict[str, dict[str, str]] = {
     },
 }
 
-_SETTINGS_PATH = presets._presets_dir().parent / "settings.json"
+_SETTINGS_PATH = paths.settings_path()
 
 FILE_TYPES = [
     ("All supported", "*.pdf *.docx *.xlsx *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp"),
@@ -1020,8 +1020,26 @@ class CustomizerDialog:
         self.win.destroy()
 
 
+def _create_root() -> tk.Tk:
+    """Create the main window, degrading gracefully when drag & drop is unusable.
+
+    ``tkinterdnd2`` imports fine on systems where its bundled ``tkdnd`` binary
+    does not match the installed Tk ABI (observed with Tcl/Tk 9 on Linux:
+    ``this extension is compiled for Tcl 8.x``), so a successful import is not
+    proof that ``TkinterDnD.Tk()`` can start.  Losing drag & drop must never
+    stop the app from launching — file selection still works.
+    """
+    global _DND_OK
+    if _DND_OK:
+        try:
+            return TkinterDnD.Tk()
+        except Exception:  # noqa: BLE001 - any tkdnd failure => no drag & drop
+            _DND_OK = False
+    return tk.Tk()
+
+
 def main() -> None:
-    root = TkinterDnD.Tk() if _DND_OK else tk.Tk()
+    root = _create_root()
     App(root)
     root.mainloop()
 
