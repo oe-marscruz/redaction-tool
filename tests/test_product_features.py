@@ -192,6 +192,31 @@ class PseudonymTests(unittest.TestCase):
                                      scan_opts=opts)
         self.assertEqual(check["status"], "PASS")
 
+    def test_verification_does_not_advance_label_counters(self):
+        pseudonyms = Pseudonymizer()
+        opts = redactor.ScanOptions(pseudonyms=pseudonyms, use_presidio=False)
+
+        document = docx.Document()
+        document.add_paragraph("Patient: Alexandria Montoya")
+        document.save(self.td / "verify.docx")
+        redactor.redact_file(self.td / "verify.docx", opts,
+                             out_path=self.td / "verify_REDACTED.docx")
+        counters_after_redaction = dict(pseudonyms.counters)
+
+        verify.verify_export(self.td / "verify_REDACTED.docx",
+                             targeted_values=["Alexandria Montoya"],
+                             scan_opts=opts)
+        self.assertEqual(pseudonyms.counters, counters_after_redaction)
+
+        # The next document still gets the next label, not one burned by verify.
+        second = docx.Document()
+        second.add_paragraph("Unrelated note.")
+        second.add_paragraph("Alexandria Montoya")
+        second.save(self.td / "verify2.docx")
+        redactor.redact_file(self.td / "verify2.docx", opts,
+                             out_path=self.td / "verify2_REDACTED.docx")
+        self.assertEqual(pseudonyms.counters["NAME"], counters_after_redaction["NAME"])
+
     def test_constant_replacement_is_unchanged_without_pseudonyms(self):
         document = docx.Document()
         document.add_paragraph("Patient: Alexandria Montoya")
