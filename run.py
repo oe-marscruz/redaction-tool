@@ -27,6 +27,20 @@ def _configure_bundled_dll_search() -> None:
 _configure_bundled_dll_search()
 
 
+def _ocr_test_font() -> str:
+    """First TrueType font that exists on this machine (OCR self-test only)."""
+    for candidate in (
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ):
+        if Path(candidate).is_file():
+            return candidate
+    return "arial.ttf"  # let Pillow raise; caller falls back to the built-in font
+
+
 def _selftest(outfile: str, require_ocr: bool = False,
               require_presidio: bool = False) -> int:
     """End-to-end validation without a GUI.
@@ -137,9 +151,11 @@ def _selftest(outfile: str, require_ocr: bool = False,
                     image = Image.new("RGB", (900, 180), "white")
                     draw = ImageDraw.Draw(image)
                     try:
-                        font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 48)
+                        font = ImageFont.truetype(_ocr_test_font(), 48)
                     except Exception:
-                        font = ImageFont.load_default()
+                        # Pillow >= 10.1 can scale its built-in font, which keeps
+                        # this check meaningful on hosts without a TrueType font.
+                        font = ImageFont.load_default(size=48)
                     draw.text((24, 50), "SSN 123-45-6789", fill="black", font=font)
                     source = tmpdir / "ocr-source.png"
                     image.save(source)

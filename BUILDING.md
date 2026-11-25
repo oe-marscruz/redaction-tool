@@ -1,18 +1,25 @@
-# Building the single-file Windows executable
+# Building the single-file executables
 
-The release build is a **64-bit Windows one-file executable**. It bundles the
-Python runtime, Presidio Analyzer, spaCy's English small model, Tesseract, and
-English OCR trained data. The executable does not download any models or send
-document text to a service.
+The release build for Windows is a **64-bit Windows one-file executable**. It
+bundles the Python runtime, Presidio Analyzer, spaCy's English small model,
+Tesseract, and English OCR trained data. The executable does not download any
+models or send document text to a service.
+
+A Linux one-file executable is built from the same spec by `build_linux.sh`
+(Python, Presidio and the spaCy model always; Tesseract only when a runtime is
+staged under `vendor/tesseract` — on Linux the system Tesseract is the normal
+arrangement). See [Linux](#linux) below.
 
 ## Offline & Release Security Guarantee
 
 - **Zero Outbound Network at Runtime**: Redaction, OCR, and Presidio analysis operate entirely locally.
 - **Dependency Freeze**: Pinned versions are `presidio-analyzer==2.2.364`, `spacy==3.8.11`, and `en_core_web_sm-3.8.0`.
-- **Packaged Self-Test**: The build pipeline validates `dist\RedactionTool.exe` using `--selftest --require-ocr --require-presidio`.
+- **Packaged Self-Test**: The build pipeline validates `dist\RedactionTool.exe` (Windows) and `dist/RedactionTool` (Linux) using `--selftest --require-ocr --require-presidio`.
 - **Environment Status Gate**: If required local vendor assets or Python packages are missing on the build host, packaging/verification is reported as `BLOCKED (environment)`, never falsely marked as `PASS`.
 
 ## Prerequisites
+
+### Windows prerequisites
 
 - 64-bit Windows and CPython 3.13.
 - The Tesseract source archive (`tesseract-main.zip`) is not a binary
@@ -46,7 +53,7 @@ Its pinned version is compatible with spaCy 3.8. The English model is a
 statistical NER model; it supplements the existing deterministic detector and
 does not guarantee detection of all PII.
 
-## Build
+## Windows build
 
 From PowerShell at the repository root (internet is needed on the build
 machine to download Python packages and the pinned spaCy model wheel; the
@@ -68,6 +75,58 @@ The single-file build will be large and may take longer to start because
 PyInstaller extracts its bundled files to a temporary directory at launch.
 Test the resulting executable on a clean machine without Python, Tesseract,
 or network access before distributing it.
+
+## Linux
+
+### Prerequisites
+
+- Python 3.10+ (3.13 is what CI uses), `python3-venv`, and `python3-tk` so the
+  build interpreter and the packaged binary have Tk.
+- Tesseract with English data if you want the packaged self-test's OCR check to
+  run (`sudo apt install tesseract-ocr tesseract-ocr-eng`,
+  `sudo pacman -S tesseract tesseract-data-eng`).
+- No staged binaries are needed: unlike Windows, the Linux build does not
+  bundle a Tesseract runtime by default.
+
+### Build
+
+```bash
+./build_linux.sh
+```
+
+The script creates `.venv` if needed, installs both requirement sets plus
+`pyinstaller==6.22.0`, stages the pinned spaCy model with
+`scripts/stage_assets.py` (the model wheel URL in
+`requirements-presidio-optional.txt` carries a `#sha256=` fragment, so pip
+verifies the download), runs PyInstaller against the same
+`RedactionTool.spec`, and then runs
+
+```bash
+dist/RedactionTool --selftest exe_selftest.txt --require-presidio [--require-ocr]
+```
+
+asserting `PASS bundled Presidio` and, when Tesseract is available or staged,
+`PASS bundled OCR`. `--skip-ocr-test` builds without requiring OCR.
+`PYTHON=python3.12 ./build_linux.sh` picks a different interpreter.
+
+Notes:
+
+- **OCR in a Linux binary** uses the system `tesseract` at runtime. If you want
+  a fully self-contained Linux binary, stage a Tesseract runtime under
+  `vendor/tesseract` (`tesseract`, its `.so` libraries, `tessdata/` with
+  `eng.traineddata` and `configs/tsv`); the spec then bundles it and
+  `build_linux.sh` runs the OCR self-test too. That path is not covered by CI —
+  the Windows release is the only fully bundled, self-tested artifact today.
+- The spec keeps the `docx` package sources on disk
+  (`module_collection_mode={"docx": "pyz+py"}`) because python-docx resolves its
+  header/footer templates relative to its own source path.
+- Tcl/Tk shared libraries are collected from the build interpreter's lib
+  directory, which is what makes the frozen GUI start with uv or
+  python-build-standalone interpreters.
+- `dist/RedactionTool` is a single file; there is no `.deb`, AppImage or Flatpak
+  package yet. Installing the binary is copying it somewhere on `PATH`, and
+  `./Run-RedactionTool.sh --install-desktop-entry` adds the menu entry (it
+  prefers a built binary when one exists).
 
 ### Release chain of custody
 
@@ -122,15 +181,20 @@ Details:
   removes older installed versions, refuses downgrades unless `/ForceDowngrade`
   is passed, handles a running app, offers to clean up older portable exe
   copies, and never touches `%USERPROFILE%\.redaction_tool`.
-- **CI**: `.github/workflows/ci.yml` has a `test` job that runs the unit,
-  regression, security, Presidio integration, and end-to-end suites plus the
-  synthetic evaluation corpus and the headless self-test, and an
-  `installer-smoke` job that runs `build_windows.ps1` for real on
-  `windows-latest`, asserts the packaged `PASS bundled OCR` and
-  `PASS bundled Presidio` self-test lines, and uploads the resulting setup exe
-  as the `installer-smoke` artifact. The build job verifies the pinned spaCy
-  model hash via `scripts/check_model_pin.py` before building, so a malformed
-  or drifted pin fails fast instead of only inside the release build.
+- **CI**: `.github/workflows/ci.yml` runs the checks on **both**
+  `windows-latest` and `ubuntu-latest`. The Windows `test` job runs the unit,
+  regression, security, Presidio integration, platform and end-to-end suites
+  plus the synthetic evaluation corpus and the headless self-test; the
+  `installer-smoke` job installs Tesseract, runs `build_windows.ps1` for real,
+  asserts the packaged `PASS bundled OCR` and `PASS bundled Presidio`
+  self-test lines, and uploads the resulting setup exe as the
+  `installer-smoke` artifact. The Linux `test-linux` job installs
+  `tesseract-ocr`/`python3-tk`/`xvfb`, runs the same suites plus the headless
+  GUI smoke test and the launcher self-test; `linux-bundle-smoke` runs
+  `build_linux.sh` and uploads `dist/RedactionTool`. Both jobs run the same
+  scope/safety gate (`scripts/ci_scope_gate.py`), and the build jobs verify
+  the pinned spaCy model hash (`scripts/check_model_pin.py` on Windows, pip's
+  `#sha256=` fragment on Linux) before building.
 
 ## Third-party notices
 

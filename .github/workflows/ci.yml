@@ -25,38 +25,12 @@ jobs:
           pip install -r requirements-presidio-optional.txt
 
       - name: PR Scope & Safety Gate
-        run: |
-          python -c "
-          import subprocess, sys, pathlib
-          forbidden_deps = {'requirements.txt', 'requirements-presidio-optional.txt'}
-          binary_exts = {'.dll', '.exe', '.bin', '.whl', '.traineddata', '.so', '.dylib', '.pyd', '.onnx', '.safetensors'}
-          print('=== PR Scope & Changed Path Check ===')
-          res = subprocess.run(['git', 'diff', '--name-only', 'origin/main...HEAD'], capture_output=True, text=True)
-          changed = [f.strip() for f in res.stdout.splitlines() if f.strip()]
-          if not changed:
-              res2 = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'], capture_output=True, text=True)
-              changed = [f.strip() for f in res2.stdout.splitlines() if f.strip()]
-          print('Changed files:')
-          if changed:
-              for f in changed:
-                  print('  ' + f)
-          else:
-              print('  None')
-          forbidden_mod = [f for f in changed if f in forbidden_deps]
-          if forbidden_mod:
-              print('SAFETY GATE REJECTED: Modified forbidden dependency files:', forbidden_mod)
-              sys.exit(1)
-          forbidden_bin = [f for f in changed if pathlib.Path(f).suffix.lower() in binary_exts or 'vendor/' in f.replace('\\', '/').lower()]
-          if forbidden_bin:
-              print('SAFETY GATE REJECTED: Detected committed model/vendor binary files:', forbidden_bin)
-              sys.exit(1)
-          print('SAFETY GATE PASSED: Dependency files untouched and no committed binaries detected. Note: Path scope checks provide structural path safeguards, not semantic proof against feature creep.')
-          "
+        run: python scripts/ci_scope_gate.py
 
       - name: Syntax check
         # PowerShell does not expand shell globs, so let Python do it.
         run: |
-          python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py')]]"
+          python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py'), *pathlib.Path('scripts').glob('*.py')]]"
 
       - name: Unit + regression + security tests
         run: |
@@ -66,6 +40,8 @@ jobs:
           python -m unittest tests/test_document_context.py
           python -m unittest tests/test_security_verification.py
           python -m unittest tests/test_end_to_end_presidio.py
+          python -m unittest tests/test_platform_paths.py
+          python -m unittest tests/test_product_features.py
 
       - name: Synthetic evaluation corpus
         run: python tests/eval_metrics.py
@@ -75,6 +51,113 @@ jobs:
 
       - name: Show self-test result
         run: type result.txt
+
+  # Same checks as the Windows job, on Linux. This is the regression gate for
+  # the cross-platform paths, launcher, Tesseract discovery and GUI startup.
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install system packages
+        # tesseract + English data: the OCR path uses the distro Tesseract on
+        # Linux. python3-tk provides the Tk shared libraries that the
+        # setup-python interpreter links against. xvfb runs the GUI test.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-eng python3-tk xvfb
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-presidio-optional.txt
+
+      - name: PR Scope & Safety Gate
+        run: python scripts/ci_scope_gate.py
+
+      - name: Environment report
+        # Fails loudly instead of silently skipping the GUI test if Tk or
+        # Tesseract is missing from the runner image.
+        run: |
+          python tests/check_dependencies.py
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Syntax check
+        run: |
+          python -c "import py_compile, pathlib; [py_compile.compile(str(p), doraise=True) for p in [pathlib.Path('run.py'), pathlib.Path('validate_real_files.py'), *pathlib.Path('redaction_tool').glob('*.py'), *pathlib.Path('scripts').glob('*.py')]]"
+
+      - name: Unit + regression + security tests
+        run: |
+          python tests/test_core.py
+          python tests/test_high_recall.py
+          python tests/test_presidio_integration.py
+          python -m unittest tests/test_document_context.py
+          python -m unittest tests/test_security_verification.py
+          python -m unittest tests/test_end_to_end_presidio.py
+          python -m unittest tests/test_platform_paths.py
+          python -m unittest tests/test_product_features.py
+
+      - name: GUI smoke test (headless X server)
+        run: xvfb-run -a python -m unittest tests/test_gui_smoke.py
+
+      - name: Synthetic evaluation corpus
+        run: python tests/eval_metrics.py
+
+      - name: Headless self-test
+        run: python run.py --selftest result.txt
+
+      - name: Show self-test result
+        run: cat result.txt
+
+      - name: Launcher smoke test
+        # The double-click launcher must work from a clean checkout.
+        run: |
+          ./Run-RedactionTool.sh --help
+          ./Run-RedactionTool.sh --selftest launcher_result.txt
+          cat launcher_result.txt
+
+  # Builds the real Linux binary and asserts its packaged Presidio and OCR
+  # self-tests pass. Mirrors installer-smoke for the Windows executable.
+  linux-bundle-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Tesseract OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng python3-tk
+
+      - name: Build real executable
+        # build_linux.sh creates .venv, installs both requirement sets plus
+        # PyInstaller, stages the pinned spaCy model, builds, and runs the
+        # packaged self-test (Presidio + OCR).
+        run: ./build_linux.sh
+
+      - name: Verify packaged self-test report
+        run: |
+          grep -q "PASS bundled Presidio" exe_selftest.txt
+          grep -q "PASS bundled OCR" exe_selftest.txt
+          cat exe_selftest.txt
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle-smoke
+          path: dist/RedactionTool
+          if-no-files-found: error
 
   # Builds the real executable and asserts the packaged Presidio and OCR
   # self-tests pass. A placeholder-exe script-compile smoke test cannot detect
@@ -90,6 +173,28 @@ jobs:
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
+
+      - name: Install Tesseract OCR
+        # windows-latest no longer ships Tesseract at
+        # C:\Program Files\Tesseract-OCR, so install it explicitly instead of
+        # assuming the image provides it.
+        run: choco install tesseract -y --no-progress
+
+      - name: Locate Tesseract
+        id: tesseract
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files\Tesseract-OCR",
+            "C:\Program Files (x86)\Tesseract-OCR"
+          )
+          $dir = $candidates | Where-Object { Test-Path (Join-Path $_ "tesseract.exe") } |
+            Select-Object -First 1
+          if (-not $dir) {
+            Write-Error "Tesseract was not found after installation"; exit 1
+          }
+          Write-Host "Using Tesseract at $dir"
+          "dir=$dir" >> $env:GITHUB_OUTPUT
 
       - name: Read package version
         id: version
@@ -110,11 +215,7 @@ jobs:
         # detect a presidio-less build, so exercise the real build instead.
         run: |
           $ErrorActionPreference = "Stop"
-          $tesseract = "C:\Program Files\Tesseract-OCR"
-          if (-not (Test-Path (Join-Path $tesseract "tesseract.exe"))) {
-            Write-Error "Tesseract not found at '$tesseract'"; exit 1
-          }
-          .\build_windows.ps1 -TesseractDir $tesseract
+          .\build_windows.ps1 -TesseractDir "${{ steps.tesseract.outputs.dir }}"
           # Throws surface as non-terminating by default in some hosts, so
           # assert the real outputs rather than trusting the exit code alone.
           if (-not (Test-Path "dist\RedactionTool.exe")) {

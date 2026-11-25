@@ -9,10 +9,12 @@ scrubbed as part of every redaction.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .detector import CATEGORY_MAP, Match, detect
+from . import audit as audit_mod
+from . import pseudonyms as pseudonyms_mod
 
 # ── optional dependencies ──────────────────────────────────────────────────
 
@@ -54,6 +56,8 @@ class RedactResult:
     # Fail-closed recoverability: PASS, NEEDS_REVIEW, or None if not run.
     recoverability: str | None = None
     recoverability_leaked: int = 0
+    # [{"where": "page 2", "categories": {"names": 1}}, ...] — no plaintext.
+    audit: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -69,11 +73,35 @@ class ScanOptions:
     hash_salt: str = ""
     # Optional local Presidio NER supplement for text and OCR pipelines.
     use_presidio: bool = False
+    # When set, each match is replaced with a stable typed label
+    # ("[NAME_1]") instead of the constant ``replacement``.  Share one
+    # Pseudonymizer across every file in a batch to keep subjects consistent.
+    pseudonyms: "pseudonyms_mod.Pseudonymizer | None" = None
+    # Set by redact_file() for the duration of one document so engines can
+    # record *where* each category was removed.  None during plain scans.
+    audit: "audit_mod.RedactionAudit | None" = None
 
     def run_detection(self, text: str, ledger: _ledger.EntityLedger | None = None, context: list[str] | None = None) -> list[Match]:
         return detect(text, self.enabled_categories,
                       self.custom_patterns, self.custom_texts,
                       use_presidio=self.use_presidio, ledger=ledger, context=context)
+
+    def replacement_for(self, match: Match) -> str:
+        """Replacement text for one match (constant or typed pseudonym)."""
+        if self.pseudonyms is None:
+            return self.replacement
+        return self.pseudonyms.label_for(match.category, match.text)
+
+    def label_for(self, category: str, value: str) -> str:
+        """Replacement text for a whole-value redaction of unknown value type."""
+        if self.pseudonyms is None:
+            return self.replacement
+        return self.pseudonyms.label_for(category, value)
+
+    def note(self, where: str, category: str, count: int = 1) -> None:
+        """Record a redaction location for the audit trail, if one is active."""
+        if self.audit is not None:
+            self.audit.add(where, category, count)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -168,27 +196,44 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
 
     # Pass 2: Redaction pass
     for page in doc:
-        total += _scrub_pdf_widgets(page, opts)
+        scrubbed_widgets = _scrub_pdf_widgets(page, opts)
+        total += scrubbed_widgets
+        if scrubbed_widgets:
+            opts.note(f"page {page.number + 1}", "form_field", scrubbed_widgets)
         page_text = page.get_text()
         if not page_text.strip():
             continue
         matches = opts.run_detection(page_text, ledger=doc_ledger)
-        needles = sorted({m.text for m in matches}, key=len, reverse=True)
-        for needle in needles:
-            rects = page.search_for(needle)
-            if not rects and " " in needle.strip():
-                words = needle.split()
+        for m in matches:
+            rects = page.search_for(m.text)
+            if not rects and " " in m.text.strip():
+                words = m.text.split()
                 for i in range(len(words) - 2):
                     rects.extend(page.search_for(" ".join(words[i:i + 3])))
+            label = opts.replacement_for(m) if opts.pseudonyms else None
             for rect in rects:
-                page.add_redact_annot(rect, fill=(0, 0, 0))
+                if label:
+                    # Fit the label: bounded by the box height and its width
+                    # estimate, so a long label cannot spill outside its box.
+                    size = min(9.0, max(4.0, rect.height * 0.7))
+                    size = min(size, max(4.0, rect.width / (len(label) * 0.6)))
+                    page.add_redact_annot(rect, text=label, fill=(0, 0, 0),
+                                          text_color=(1, 1, 1), fontsize=size,
+                                          align=1)
+                else:
+                    page.add_redact_annot(rect, fill=(0, 0, 0))
                 total += 1
-        for m in matches:
             per_cat[m.category] = per_cat.get(m.category, 0) + 1
+            opts.note(f"page {page.number + 1}", m.category)
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    total += _scrub_pdf_links(doc, opts)
-    total += _scrub_pdf_attachments(doc, opts)
+    removed_links = _scrub_pdf_links(doc, opts)
+    removed_attachments = _scrub_pdf_attachments(doc, opts)
+    total += removed_links + removed_attachments
+    if removed_links:
+        opts.note("links", "link", removed_links)
+    if removed_attachments:
+        opts.note("embedded files", "attachment", removed_attachments)
 
     try:
         doc.set_metadata({})
@@ -205,7 +250,8 @@ def _redact_pdf(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str,
 # DOCX
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _mask_paragraph(paragraph, opts: ScanOptions, ledger: _ledger.EntityLedger | None = None) -> tuple[int, dict[str, int]]:
+def _mask_paragraph(paragraph, opts: ScanOptions, ledger: _ledger.EntityLedger | None = None,
+                    where: str = "") -> tuple[int, dict[str, int]]:
     """Redact matches inside one paragraph, preserving run formatting."""
     text = paragraph.text
     if not text.strip():
@@ -236,12 +282,14 @@ def _mask_paragraph(paragraph, opts: ScanOptions, ledger: _ledger.EntityLedger |
                 continue
             ls = max(m.start, start) - start
             le = min(m.end, end) - start
-            repl = opts.replacement if not inserted else ""
+            repl = opts.replacement_for(m) if not inserted else ""
             run_edits.setdefault(idx, []).append((ls, le, repl))
             inserted = True
         if inserted:
             per_cat[m.category] = per_cat.get(m.category, 0) + 1
             masked += 1
+            if where:
+                opts.note(where, m.category)
 
     for idx, edits in run_edits.items():
         run = spans[idx][2]
@@ -279,7 +327,7 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.Entit
     total = 0
     per_cat: dict[str, int] = {}
 
-    def _mask_paragraph_el(w_p) -> tuple[int, dict[str, int]]:
+    def _mask_paragraph_el(w_p, where: str = "") -> tuple[int, dict[str, int]]:
         count = 0
         cats: dict[str, int] = {}
         t_elems = list(w_p.iter(W_T))
@@ -305,12 +353,14 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.Entit
                     continue
                 ls = max(m.start, start) - start
                 le = min(m.end, end) - start
-                repl = opts.replacement if not inserted else ""
+                repl = opts.replacement_for(m) if not inserted else ""
                 run_edits.setdefault(idx, []).append((ls, le, repl))
                 inserted = True
             if inserted:
                 cats[m.category] = cats.get(m.category, 0) + 1
                 count += 1
+                if where:
+                    opts.note(where, m.category)
 
         for idx, edits in run_edits.items():
             t_el = spans[idx][2]
@@ -337,9 +387,9 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.Entit
         root = getattr(part, "element", None)
 
         if root is not None:
-            for txbx in root.iter(qn("w:txbxContent")):
-                for w_p in txbx.iter(W_P):
-                    n, cats = _mask_paragraph_el(w_p)
+            for txbx_i, txbx in enumerate(root.iter(qn("w:txbxContent")), 1):
+                for p_i, w_p in enumerate(txbx.iter(W_P), 1):
+                    n, cats = _mask_paragraph_el(w_p, f"text box {txbx_i} ¶{p_i}")
                     total += n
                     for k, v in cats.items():
                         per_cat[k] = per_cat.get(k, 0) + v
@@ -347,6 +397,7 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.Entit
 
         if not partname.endswith(_DOCX_HIDDEN_PART_SUFFIXES):
             continue
+        part_kind = partname.rsplit("/", 1)[-1].replace(".xml", "")
         try:
             blob = part.blob
             if not blob:
@@ -355,8 +406,8 @@ def _redact_docx_hidden_parts(document, opts: ScanOptions, ledger: _ledger.Entit
         except Exception:
             continue
         part_count = 0
-        for w_p in root.iter(W_P):
-            n, cats = _mask_paragraph_el(w_p)
+        for p_i, w_p in enumerate(root.iter(W_P), 1):
+            n, cats = _mask_paragraph_el(w_p, f"{part_kind} ¶{p_i}")
             part_count += n
             total += n
             for k, v in cats.items():
@@ -439,27 +490,40 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
             _seed_tables(part.tables)
 
     # Pass 2: Apply redactions
-    def _process_paragraphs(paragraphs) -> None:
-        for para in paragraphs:
-            _accumulate(*_mask_paragraph(para, opts, ledger=doc_ledger))
+    def _process_paragraphs(paragraphs, where_prefix: str) -> None:
+        for i, para in enumerate(paragraphs, 1):
+            _accumulate(*_mask_paragraph(para, opts, ledger=doc_ledger,
+                                         where=f"{where_prefix} ¶{i}"))
 
-    def _process_tables(tables) -> None:
+    table_seq = 0
+
+    def _process_tables(tables, where_prefix: str = "") -> None:
+        nonlocal table_seq
         for table in tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    _process_paragraphs(cell.paragraphs)
+            table_seq += 1
+            label = (f"{where_prefix} table {table_seq}" if where_prefix
+                     else f"table {table_seq}")
+            for r, row in enumerate(table.rows, 1):
+                for c, cell in enumerate(row.cells, 1):
+                    _process_paragraphs(cell.paragraphs, f"{label} r{r} c{c}")
                     _process_tables(cell.tables)
 
-    _process_paragraphs(document.paragraphs)
+    _process_paragraphs(document.paragraphs, "body")
     _process_tables(document.tables)
-    for section in document.sections:
-        for part in (section.header, section.footer,
-                     section.first_page_header, section.first_page_footer,
-                     section.even_page_header, section.even_page_footer):
+    for section_i, section in enumerate(document.sections, 1):
+        for part, kind in (
+            (section.header, "header"),
+            (section.footer, "footer"),
+            (section.first_page_header, "first-page header"),
+            (section.first_page_footer, "first-page footer"),
+            (section.even_page_header, "even-page header"),
+            (section.even_page_footer, "even-page footer"),
+        ):
             if part is None:
                 continue
-            _process_paragraphs(part.paragraphs)
-            _process_tables(part.tables)
+            prefix = f"{kind} (section {section_i})"
+            _process_paragraphs(part.paragraphs, prefix)
+            _process_tables(part.tables, prefix)
 
     _accumulate(*_redact_docx_hidden_parts(document, opts, ledger=doc_ledger))
 
@@ -471,6 +535,7 @@ def _redact_docx(src: Path, out: Path, opts: ScanOptions) -> tuple[int, dict[str
                 setattr(cp, attr, "")
             except Exception:
                 pass
+        opts.note("document properties", "metadata")
     except Exception:
         pass
 
@@ -567,6 +632,7 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                         for m in c_matches:
                             per_cat[m.category] = per_cat.get(m.category, 0) + 1
                             total += 1
+                            opts.note(f"{ws.title}!{cell.coordinate} comment", m.category)
                         if out is not None:
                             cell.comment = None
 
@@ -580,8 +646,9 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                 if hc and cell.row > hc[0] and cell.value is not None and str(cell.value).strip():
                     per_cat[hc[1]] = per_cat.get(hc[1], 0) + 1
                     total += 1
+                    opts.note(f"{ws.title}!{cell.coordinate}", hc[1])
                     if out is not None:
-                        cell.value = opts.replacement
+                        cell.value = opts.label_for(hc[1], str(cell.value))
                     continue
 
                 value = cell.value
@@ -595,13 +662,14 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                 for m in matches:
                     per_cat[m.category] = per_cat.get(m.category, 0) + 1
                     total += 1
+                    opts.note(f"{ws.title}!{cell.coordinate}", m.category)
 
                 if out is not None:
-                    cell_matches = _dedupe(matches)
+                    cell_matches = _dedupe(matches, value)
                     cell_matches.sort(key=lambda x: x.start, reverse=True)
                     chars = list(value)
                     for m in cell_matches:
-                        chars[m.start:m.end] = list(opts.replacement)
+                        chars[m.start:m.end] = list(opts.replacement_for(m))
                     cell.value = "".join(chars)
 
         for hf in (ws.oddHeader, ws.evenHeader, ws.firstHeader,
@@ -617,6 +685,7 @@ def _process_xlsx(src: Path, opts: ScanOptions,
                     for m in h_matches:
                         per_cat[m.category] = per_cat.get(m.category, 0) + 1
                         total += 1
+                        opts.note(f"{ws.title} print header/footer", m.category)
                     if out is not None:
                         section.text = ""
                         total += 1
@@ -632,6 +701,7 @@ def _process_xlsx(src: Path, opts: ScanOptions,
             props.title = ""
             props.subject = ""
             props.description = ""
+            opts.note("workbook properties", "metadata")
         except Exception:
             pass
         wb.save(str(out))
@@ -746,6 +816,8 @@ def redact_file(src_path: str | Path,
     src = Path(src_path)
     ext = src.suffix.lower()
     result = RedactResult(src=src)
+    # Fresh location trail per document; the caller's options stay untouched.
+    run_opts = replace(opts, audit=audit_mod.RedactionAudit())
 
     try:
         if ext not in SUPPORTED_EXTENSIONS:
@@ -758,14 +830,16 @@ def redact_file(src_path: str | Path,
                 raise RuntimeError(
                     "Tesseract OCR is required for image files. Install it from "
                     "https://github.com/UB-Mannheim/tesseract/wiki")
-            plan = _ocr.scan_ocr_image(src, scan_opts=opts)
+            plan = _ocr.scan_ocr_image(src, scan_opts=run_opts)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             _ocr.apply_ocr_redactions(src, plan, out_path)
             result.redaction_count = len(plan["detections"])
             for d in plan["detections"]:
                 result.per_category[d["entity_type"]] = \
                     result.per_category.get(d["entity_type"], 0) + 1
+                run_opts.note(f"page {d.get('page', 1)} (OCR)", d["entity_type"])
             result.outputs.append(out_path)
+            result.audit = run_opts.audit.as_list()
             return result
 
         missing = {".pdf": (not _PDF_OK, "PyMuPDF (fitz)"),
@@ -786,15 +860,16 @@ def redact_file(src_path: str | Path,
             raise ValueError("Output path equals the source file — refusing to overwrite.")
 
         if ext == ".pdf":
-            count, per_cat = _redact_pdf(src, out_path, opts)
+            count, per_cat = _redact_pdf(src, out_path, run_opts)
         elif ext == ".docx":
-            count, per_cat = _redact_docx(src, out_path, opts)
+            count, per_cat = _redact_docx(src, out_path, run_opts)
         else:
-            count, per_cat = _redact_xlsx(src, out_path, opts)
+            count, per_cat = _redact_xlsx(src, out_path, run_opts)
 
         result.redaction_count = count
         result.per_category = per_cat
         result.outputs.append(out_path)
+        result.audit = run_opts.audit.as_list()
 
         # Fail-closed recoverability: re-extract every reachable representation
         # and confirm targeted values of length >= 4 are gone.  Does not log
@@ -821,6 +896,7 @@ def redact_file(src_path: str | Path,
 
     except Exception as exc:  # noqa: BLE001 — surface per-file errors
         result.error = str(exc)
+    result.audit = run_opts.audit.as_list()
     return result
 
 

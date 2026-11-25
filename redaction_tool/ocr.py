@@ -47,7 +47,20 @@ except ImportError:
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 PDF_EXTS = {".pdf"}
 
+TESSERACT_EXE_NAMES = ("tesseract.exe", "tesseract")
 DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Where distro packages and local builds put ``eng.traineddata`` on Linux.
+# Windows locations are listed as well so one candidate list works everywhere.
+TESSDATA_DIRS = (
+    r"C:\Program Files\Tesseract-OCR\tessdata",
+    r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+    "/usr/share/tessdata",
+    "/usr/local/share/tessdata",
+    "/usr/share/tesseract-ocr/5/tessdata",
+    "/usr/share/tesseract-ocr/4.00/tessdata",
+    "/opt/homebrew/share/tessdata",
+)
 
 
 def _resource_path(*parts: str) -> Path:
@@ -72,11 +85,16 @@ class OCRWord:
     end: int = 0
 
 
+def _bundled_tesseract_paths() -> list[str]:
+    """Bundled executable first, using the name the platform's binary has."""
+    return [str(_resource_path("tesseract", name)) for name in TESSERACT_EXE_NAMES]
+
+
 def find_tesseract() -> Optional[str]:
     """Prefer the bundled OCR executable, then support local dev installs."""
     import shutil
     candidates = [
-        str(_resource_path("tesseract", "tesseract.exe")),
+        *_bundled_tesseract_paths(),
         os.environ.get("TESSERACT_CMD", ""),
         DEFAULT_TESSERACT,
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
@@ -95,31 +113,73 @@ def find_tesseract() -> Optional[str]:
     return None
 
 
-def find_tessdata(tesseract_cmd: Optional[str] = None) -> Optional[Path]:
-    """Find the English trained-data folder bundled with the executable."""
-    if tesseract_cmd:
-        executable = tesseract_cmd
-    elif hasattr(sys, "_MEIPASS"):
-        executable = str(_resource_path("tesseract", "tesseract.exe"))
-    else:
-        executable = find_tesseract()
-    bundled_data = _resource_path("tesseract", "tessdata")
-    candidates = [
-        bundled_data,
-        _resource_path("tesseract"),
-        Path(os.environ.get("TESSDATA_PREFIX", "")) if os.environ.get("TESSDATA_PREFIX") else None,
-    ]
-    if executable:
-        candidates.append(Path(executable).parent / "tessdata")
-    candidates.extend((
-        Path(r"C:\Program Files\Tesseract-OCR\tessdata"),
-        Path(r"C:\Program Files (x86)\Tesseract-OCR\tessdata"),
-    ))
-    for candidate in candidates:
-        if (candidate and (candidate / "eng.traineddata").is_file()
-                and (candidate / "configs" / "tsv").is_file()):
-            return candidate
+def _tessdata_dir_from_tesseract(executable: Optional[str]) -> Optional[Path]:
+    """Ask the local Tesseract where its trained data lives.
+
+    Distro packages disagree about the directory (``/usr/share/tessdata`` vs
+    ``/usr/share/tesseract-ocr/<major>/tessdata``), so the binary is the most
+    reliable source.  ``--list-langs`` writes
+    ``List of available languages in "<dir>" (n):`` to stdout or stderr,
+    depending on the build.
+    """
+    if not executable:
+        return None
+    try:
+        proc = subprocess.run([executable, "--list-langs"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=10)
+    except Exception:
+        return None
+    output = f"{proc.stdout}\n{proc.stderr}"
+    match = re.search(r'languages in "([^"]+)"', output)
+    if match:
+        return Path(match.group(1))
     return None
+
+
+def _tessdata_choice(dirs, english_only: Optional[Path]):
+    """Return the first usable directory, preferring one with the TSV config."""
+    for candidate in dirs:
+        if not candidate or not (candidate / "eng.traineddata").is_file():
+            continue
+        if (candidate / "configs" / "tsv").is_file():
+            return candidate, english_only
+        if english_only is None:
+            english_only = candidate
+    return None, english_only
+
+
+def find_tessdata(tesseract_cmd: Optional[str] = None) -> Optional[Path]:
+    """Find the English trained-data folder for the bundled or system Tesseract.
+
+    Returns the first directory that has both ``eng.traineddata`` and the TSV
+    output config; failing that, the first directory that at least has the
+    English data (``run_ocr`` then requests TSV output with ``-c`` instead of
+    the missing config file).
+    """
+    executable = tesseract_cmd or find_tesseract()
+    env_prefix = os.environ.get("TESSDATA_PREFIX", "").strip()
+    candidates = [
+        _resource_path("tesseract", "tessdata"),
+        _resource_path("tesseract"),
+    ]
+    if env_prefix:
+        prefix = Path(env_prefix)
+        candidates.extend((prefix, prefix / "tessdata"))
+    if executable:
+        candidates.extend((Path(executable).parent / "tessdata",
+                           Path(executable).resolve().parent / "tessdata"))
+
+    found, english_only = _tessdata_choice(candidates, None)
+    if found:
+        return found
+
+    # Only ask the binary when the cheap guesses failed: probing costs a
+    # subprocess spawn and a page-by-page OCR run should not pay it.
+    probed = _tessdata_dir_from_tesseract(executable)
+    fallback = ([probed] if probed else []) + [Path(p) for p in TESSDATA_DIRS]
+    found, english_only = _tessdata_choice(fallback, english_only)
+    return found or english_only
 
 
 def check_dependencies() -> dict:
@@ -142,19 +202,26 @@ def run_ocr(image_path: Path, lang: str = "eng",
     cmd = tesseract_cmd or find_tesseract()
     if not cmd:
         raise RuntimeError(
-            "Tesseract OCR not found. Install from "
-            "https://github.com/UB-Mannheim/tesseract/wiki and ensure "
-            "tesseract.exe is on your PATH or set TESSERACT_CMD."
+            "Tesseract OCR not found. Install it (Windows: "
+            "https://github.com/UB-Mannheim/tesseract/wiki, Linux: "
+            "'sudo apt install tesseract-ocr tesseract-ocr-eng' or "
+            "'sudo pacman -S tesseract tesseract-data-eng') and make sure "
+            "tesseract is on your PATH, or set TESSERACT_CMD."
         )
     tessdata = find_tessdata(tesseract_cmd)
     if not tessdata:
         raise RuntimeError(
             "Tesseract English data (eng.traineddata) was not found. "
-            "The packaged app should include it under tesseract/tessdata."
+            "The packaged app should include it under tesseract/tessdata; "
+            "distro packages usually install it under /usr/share/tessdata."
         )
+    # The 'tsv' config file is missing from some Linux packages; the setting it
+    # contains can be passed directly instead of failing on the missing file.
+    tsv_arg = (["tsv"] if (tessdata / "configs" / "tsv").is_file()
+               else ["-c", "tessedit_create_tsv=1"])
     proc = subprocess.run(
         [cmd, str(image_path), "stdout", "--tessdata-dir", str(tessdata),
-         "-l", lang, "tsv"],
+         "-l", lang, *tsv_arg],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace", timeout=120,
     )
@@ -164,7 +231,7 @@ def run_ocr(image_path: Path, lang: str = "eng",
         if "Error opening data file" in proc.stderr:
             proc = subprocess.run(
                 [cmd, str(image_path), "stdout", "--tessdata-dir", str(tessdata.parent),
-                 "-l", lang, "tsv"],
+                 "-l", lang, *tsv_arg],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=120,
             )
@@ -272,6 +339,11 @@ def detect_on_ocr(words: list[OCRWord],
             "sha256": hashlib.sha256((salt + m.text).encode("utf-8")).hexdigest(),
             "action": "redact",
         }
+        pseudonyms = getattr(opts, "pseudonyms", None)
+        if pseudonyms is not None:
+            # Label only — never the source value.  Kept in the plan so the
+            # overlay pass can render the same [NAME_1] style label.
+            entry["label"] = pseudonyms.label_for(m.category, m.text)
         plan_entries.append(entry)
     return plan_entries, warnings
 
@@ -356,7 +428,15 @@ def apply_pdf_ocr_redactions(pdf_path: Path, plan: dict, out: Path) -> None:
         page = doc[pno - 1]
         for d in entries:
             rect = pymupdf.Rect(*d["bbox"])
-            page.add_redact_annot(rect, fill=(0, 0, 0), cross_out=False)
+            label = d.get("label")
+            if label:
+                size = min(9.0, max(4.0, rect.height * 0.7))
+                size = min(size, max(4.0, rect.width / (len(label) * 0.6)))
+                page.add_redact_annot(rect, text=label, fill=(0, 0, 0),
+                                      text_color=(1, 1, 1), fontsize=size,
+                                      align=1, cross_out=False)
+            else:
+                page.add_redact_annot(rect, fill=(0, 0, 0), cross_out=False)
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS)
     doc.save(str(out), garbage=4, deflate=True)
     doc.close()
