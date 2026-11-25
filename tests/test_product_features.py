@@ -331,7 +331,7 @@ class AuditTrailTests(unittest.TestCase):
             }],
         }
         log_path, report_path = write_batch_artifacts(self.td, batch)
-        serialized = log_path.read_text() + report_path.read_text()
+        serialized = log_path.read_text(encoding="utf-8") + report_path.read_text(encoding="utf-8")
         for secret in ("Brianna", "Ynostroza", "123-45-6789"):
             self.assertNotIn(secret, serialized)
         self.assertIn("names", serialized)

@@ -26,6 +26,16 @@ $dlls = @(Get-ChildItem -LiteralPath $TesseractDir -Recurse -File |
     Where-Object { $_.Extension -in ".dll", ".pyd" })
 if ($dlls.Count -eq 0) { throw "No Tesseract runtime DLLs found in '$TesseractDir'." }
 
+# RedactionTool.spec bundles OCR from vendor\tesseract only, so stage an
+# external -TesseractDir (e.g. a fresh choco install in CI) into that folder.
+$vendorTesseract = Join-Path $root "vendor\tesseract"
+if ((Resolve-Path -LiteralPath $TesseractDir).Path -ne [IO.Path]::GetFullPath($vendorTesseract)) {
+    Write-Host "Staging Tesseract from $TesseractDir to $vendorTesseract..."
+    if (Test-Path -LiteralPath $vendorTesseract) { Remove-Item -LiteralPath $vendorTesseract -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $vendorTesseract) | Out-Null
+    Copy-Item -LiteralPath $TesseractDir -Destination $vendorTesseract -Recurse
+}
+
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Invoke-Expression "$Python -m venv .venv"
