@@ -14,12 +14,18 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tkinter as tk  # noqa: E402
+try:
+    import tkinter as tk  # noqa: E402
 
-from redaction_tool import gui  # noqa: E402
+    from redaction_tool import gui  # noqa: E402
+except Exception:  # noqa: BLE001 - no Tk at all means the test cannot run
+    tk = None
+    gui = None
 
 
 def _display_available() -> bool:
+    if tk is None or gui is None:
+        return False
     try:
         root = tk.Tk()
     except Exception:
