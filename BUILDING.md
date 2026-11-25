@@ -14,7 +14,7 @@ arrangement). See [Linux](#linux) below.
 
 - **Zero Outbound Network at Runtime**: Redaction, OCR, and Presidio analysis operate entirely locally.
 - **Dependency Freeze**: Pinned versions are `presidio-analyzer==2.2.364`, `spacy==3.8.11`, and `en_core_web_sm-3.8.0`.
-- **Packaged Self-Test**: The build pipeline validates `dist\RedactionTool.exe` using `--selftest --require-ocr --require-presidio`.
+- **Packaged Self-Test**: The build pipeline validates `dist\RedactionTool.exe` (Windows) and `dist/RedactionTool` (Linux) using `--selftest --require-ocr --require-presidio`.
 - **Environment Status Gate**: If required local vendor assets or Python packages are missing on the build host, packaging/verification is reported as `BLOCKED (environment)`, never falsely marked as `PASS`.
 
 ## Prerequisites
@@ -114,9 +114,9 @@ Notes:
 - **OCR in a Linux binary** uses the system `tesseract` at runtime. If you want
   a fully self-contained Linux binary, stage a Tesseract runtime under
   `vendor/tesseract` (`tesseract`, its `.so` libraries, `tessdata/` with
-  `eng.traineddata` and `configs/tsv`); the spec then bundles it and passes
-  `--require-ocr`. That path is not covered by CI — the Windows release is the
-  only fully bundled, self-tested artifact today.
+  `eng.traineddata` and `configs/tsv`); the spec then bundles it and
+  `build_linux.sh` runs the OCR self-test too. That path is not covered by CI —
+  the Windows release is the only fully bundled, self-tested artifact today.
 - The spec keeps the `docx` package sources on disk
   (`module_collection_mode={"docx": "pyz+py"}`) because python-docx resolves its
   header/footer templates relative to its own source path.

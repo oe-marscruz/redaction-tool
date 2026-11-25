@@ -3,9 +3,9 @@
 A local desktop tool that **permanently redacts** protected information from
 **PDF, DOCX, and XLSX** documents. Everything runs on your machine — nothing
 is uploaded anywhere, unlike Adobe Acrobat online services or ChatGPT.
-Runs on **Windows 11 (and 10)** and **Linux**; Windows ships as a signed-free
-single-file `.exe` with an installer, Linux runs from source or from a
-single-file binary (see [Quickstart](#quickstart)).
+Runs on **Windows 11 (and 10)** and **Linux**. Windows has a single-file
+`.exe` and a per-user installer; Linux runs from source or from a single-file
+binary (see [Quickstart](#quickstart)).
 Includes **light and dark mode** (toggle in the top-right corner; your choice
 is remembered between sessions in the per-user settings file — see
 [Where your settings live](#where-your-settings-live)).
@@ -67,8 +67,9 @@ Check the environment at any time (Tesseract, English data, Presidio, PyMuPDF):
 **Linux packaging status:** the single-file binary is built and verified by
 `./build_linux.sh` (see [BUILDING.md](BUILDING.md)); there is no distro package
 or Flatpak yet, so the launcher or the venv install is the supported path.
-Drag & drop needs a Tk 8.6 build of `tkinterdnd2`; on Tk 9 systems the app
-starts normally with drag & drop disabled and file-picker selection instead.
+Drag & drop needs a Tcl/Tk 8.x runtime (`tkinterdnd2`'s bundled `tkdnd`
+does not load under Tcl/Tk 9); elsewhere the app still starts, with drag &
+drop disabled and the file picker used instead.
 
 ## Where your settings live
 
@@ -80,7 +81,6 @@ starts normally with drag & drop disabled and file-picker selection instead.
 On Linux, if `~/.redaction_tool/` already exists (an older source run) and the
 XDG directory does not, the tool keeps using the old directory so presets are
 never lost. Presets and settings survive upgrades and uninstalls on both OSes.
-
 
 ## What it detects
 
