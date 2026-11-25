@@ -41,6 +41,7 @@ jobs:
           python -m unittest tests/test_security_verification.py
           python -m unittest tests/test_end_to_end_presidio.py
           python -m unittest tests/test_platform_paths.py
+          python -m unittest tests/test_product_features.py
 
       - name: Synthetic evaluation corpus
         run: python tests/eval_metrics.py
@@ -102,6 +103,7 @@ jobs:
           python -m unittest tests/test_security_verification.py
           python -m unittest tests/test_end_to_end_presidio.py
           python -m unittest tests/test_platform_paths.py
+          python -m unittest tests/test_product_features.py
 
       - name: GUI smoke test (headless X server)
         run: xvfb-run -a python -m unittest tests/test_gui_smoke.py

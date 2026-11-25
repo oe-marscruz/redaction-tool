@@ -133,6 +133,15 @@ def verify_export(
             "warnings": ["output missing or empty"],
         }
 
+    # Verification only detects; it must never allocate pseudonym labels, which
+    # would advance the batch counter for text that is never written.
+    if scan_opts is not None and getattr(scan_opts, "pseudonyms", None) is not None:
+        try:
+            from dataclasses import replace as _replace
+            scan_opts = _replace(scan_opts, pseudonyms=None)
+        except Exception:
+            pass
+
     try:
         blob = recoverable_text(path)
     except Exception as exc:

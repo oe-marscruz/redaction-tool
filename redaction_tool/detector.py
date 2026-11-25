@@ -78,6 +78,30 @@ def _has_digit(text: str) -> bool:
     return any(ch.isdigit() for ch in text)
 
 
+def _financial_valid(text: str) -> bool:
+    """Financial matches are labeled currency amounts or Luhn-valid card PANs."""
+    return "$" in text or _luhn_valid(text)
+
+
+def _luhn_valid(text: str) -> bool:
+    """Validator: keep only 13-19 digit runs that pass the Luhn checksum.
+
+    A 16-digit run is otherwise indistinguishable from an unrelated numeric
+    identifier; the checksum removes that class of false positives.
+    """
+    digits = [int(ch) for ch in text if ch.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
 # ── Common first names (broad coverage across demographics) ───────────────
 
 _COMMON_FIRST_NAMES: frozenset[str] = frozenset({
@@ -294,7 +318,7 @@ CATEGORIES: list[Category] = [
                 r"(?i:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Court|Ct|"
                 r"Circle|Cir|Boulevard|Blvd|Way|Place|Pl|Terrace|Ter|Highway|"
                 r"Hwy|Parkway|Pkwy|Trail|Trl)\b\.?"
-                r"(?:\s*(?:#|(?i:Apt|Apartment|Suite|Ste|Unit))\s*\.?\s*\w+)?"
+                r"(?:\s*,?\s*(?:#|(?i:Apt|Apartment|Suite|Ste|Unit))\s*\.?\s*\w+)?"
             ),
             # PO Box
             _c(r"\b(?i:P\.?\s*O\.?\s*Box)\s+\d+\b"),
@@ -514,7 +538,13 @@ CATEGORIES: list[Category] = [
         patterns=[
             _c(r"\b(?i:Tuition|Fees|Balance|Payment|Financial\s+Aid|Loan|Grant|"
                r"Scholarship|Salary|Wages?|Stipend|Award)[:\s]*\$[\d,]+(?:\.\d{2})?\b"),
+            # Payment card PANs: 4-4-4-4 grouped, or a bare 13-19 digit run.
+            # The Luhn validator (HIPAA #10 / GLBA financial data) keeps
+            # unrelated long numbers out.
+            _c(r"\b\d{4}(?:[ -]\d{4}){2,3}\b"),
+            _c(r"\b\d{13,19}\b"),
         ],
+        validator=_financial_valid,
     ),
 ]
 
@@ -580,57 +610,82 @@ def _mk(text: str, category: str, start: int, end: int,
     )
 
 
-def _dedupe(matches: list[Match]) -> list[Match]:
-    """Resolve overlaps conservatively so sensitive coverage union never shrinks."""
+_CONFIDENCE_RANK = {POSSIBLE: 0, LIKELY: 1, CONFIRMED: 2}
+
+# Categories whose detections are routinely re-derived inside another
+# category's span (a surname, an ID inside a labeled account number, a phone
+# inside a fax line).  A nested one is redundant.  A structured detector is
+# never dropped for a statistical container (Presidio can mislabel an IPv6
+# address as a location, for example).
+_NESTED_REDUNDANT = frozenset({"names", "unique_ids", "phones", "dates"})
+
+
+def _merge_into(prev: Match, m: Match, text: str | None) -> None:
+    """Grow *prev* to the union of both spans, keeping the strongest evidence."""
+    prev.start = min(prev.start, m.start)
+    prev.end = max(prev.end, m.end)
+    if text is not None and 0 <= prev.start <= prev.end <= len(text):
+        prev.text = text[prev.start:prev.end]
+    if _CONFIDENCE_RANK.get(m.confidence, 0) > _CONFIDENCE_RANK.get(prev.confidence, 0):
+        prev.confidence = m.confidence
+    if m.evidence and m.evidence not in prev.evidence:
+        prev.evidence = "+".join(part for part in (prev.evidence, m.evidence) if part)
+
+
+def _dedupe(matches: list[Match], text: str | None = None) -> list[Match]:
+    """Resolve overlaps without shrinking the redacted coverage union.
+
+    Two stages, both coverage-preserving:
+      1. Overlapping matches of the *same* category become one union span.  A
+         name fragment ("Reddy's") and its full form ("Saanvi Reddy"), or a
+         PO-box address and the bare ZIP inside it, describe the same
+         protected region and must be reported and redacted once.
+      2. A match strictly contained in another category's match is redundant:
+         the container already redacts every character.  Reporting it again
+         double-counts the region and inflates per-category totals.  Explicit
+         ``custom`` matches are never dropped.
+
+    ``text`` (the original input) lets union spans carry the real document
+    slice so PDF ``search_for`` and audit locations stay exact.
+    """
     if not matches:
         return []
 
-    matches.sort(key=lambda x: (x.start, -(x.end - x.start)))
-    deduped: list[Match] = []
-    confidence_rank = {POSSIBLE: 0, LIKELY: 1, CONFIRMED: 2}
+    ranked = sorted(matches, key=lambda x: (x.start, -(x.end - x.start)))
 
-    for m in matches:
-        if not deduped:
-            deduped.append(m)
-            continue
-
-        prev = deduped[-1]
-
-        # Case 1: Exact same span
-        if m.start == prev.start and m.end == prev.end:
-            prev_rank = confidence_rank.get(prev.confidence, 0)
-            m_rank = confidence_rank.get(m.confidence, 0)
-            if m_rank > prev_rank:
-                prev.confidence = m.confidence
-                prev.category = m.category
-                prev.entity_type = m.entity_type
-            if m.evidence and m.evidence not in prev.evidence:
-                prev.evidence = "+".join(part for part in (prev.evidence, m.evidence) if part)
-            continue
-
-        # Case 2: Overlapping spans
-        if m.start < prev.end:
-            # Subsumed span
-            if m.end <= prev.end:
-                m_rank = confidence_rank.get(m.confidence, 0)
-                prev_rank = confidence_rank.get(prev.confidence, 0)
-                if m_rank > prev_rank or m.category != prev.category:
-                    if m.evidence and m.evidence not in prev.evidence:
-                        prev.evidence = "+".join(part for part in (prev.evidence, m.evidence) if part)
-                    if m_rank > prev_rank:
-                        prev.confidence = m.confidence
-                    if m.category != prev.category:
-                        deduped.append(m)
-                else:
-                    if m.evidence and m.evidence not in prev.evidence:
-                        prev.evidence = "+".join(part for part in (prev.evidence, m.evidence) if part)
+    merged: list[Match] = []
+    for m in ranked:
+        current = m
+        i = 0
+        while i < len(merged):
+            p = merged[i]
+            if p.category == current.category and p.start < current.end and current.start < p.end:
+                _merge_into(p, current, text)
+                current = p
+                merged.pop(i)
+                i = 0  # the wider union may now reach an earlier span
                 continue
+            i += 1
+        merged.append(current)
 
-            # Partial overlap extending beyond prev
-            deduped.append(m)
+    merged.sort(key=lambda x: (x.start, -(x.end - x.start)))
+    deduped: list[Match] = []
+    for m in merged:
+        exact = next((d for d in deduped if d.start == m.start and d.end == m.end), None)
+        if exact is not None:
+            if m.category != exact.category and \
+                    _CONFIDENCE_RANK.get(m.confidence, 0) > _CONFIDENCE_RANK.get(exact.confidence, 0):
+                exact.category = m.category
+                exact.entity_type = m.entity_type
+                exact.confidence = m.confidence
+            if m.evidence and m.evidence not in exact.evidence:
+                exact.evidence = "+".join(part for part in (exact.evidence, m.evidence) if part)
             continue
-
-        # Case 3: Non-overlapping
+        if m.category in _NESTED_REDUNDANT and any(
+                d.category != m.category and d.start <= m.start and m.end <= d.end
+                and (d.start < m.start or m.end < d.end)
+                for d in deduped):
+            continue
         deduped.append(m)
 
     deduped.sort(key=lambda x: (x.start, x.end))
@@ -639,6 +694,29 @@ def _dedupe(matches: list[Match]) -> list[Match]:
 
 def _map_norm_span(index: list[int], start: int, end: int, orig_len: int) -> tuple[int, int]:
     return _normalize.map_span(index, start, end, orig_len)
+
+
+_US_STATE_CODES = frozenset(part for part in _US_STATES.replace("\\", "").split("|")
+                            if len(part) == 2)
+_BARE_ZIP_RE = re.compile(r"\d{5}")
+
+
+def _bare_zip_without_context(text: str, m: Match) -> bool:
+    """True for a bare 5-digit ZIP that has no ZIP cue around it.
+
+    Five-digit runs are also catalog numbers, amounts, and IDs, so a bare
+    match is only treated as a ZIP when it is labeled ("ZIP 80203"), follows
+    "City, ST", or carries a ZIP+4 suffix.  Contextual ZIPs are unaffected.
+    """
+    if not _BARE_ZIP_RE.fullmatch(m.text.strip()):
+        return False
+    prefix = text[max(0, m.start - 40):m.start]
+    if re.search(r"(?i:zip(?:\s*code)?|postal(?:\s*code)?)\s*[:#]?\s*$", prefix):
+        return False
+    tail = re.search(r",\s*([A-Z]{2})\s*$", prefix)
+    if tail and tail.group(1) in _US_STATE_CODES:
+        return False
+    return True
 
 
 # Presidio is an optional in-process supplement. Explicitly configure the
@@ -668,6 +746,9 @@ _offline_tldextract_configured = False
 # admitting these only adds false positives. Measured on the synthetic corpus:
 # 0.0 -> P=0.8366, 0.65 -> P=0.9270, with recall unchanged at 0.9942 throughout.
 _PRESIDIO_MIN_SCORE = 0.65
+
+# Single-token "locations" the model emits from labels and country codes.
+_LOCATION_STOP = frozenset({"us", "usa", "u.s.", "u.s.a.", "uk", "u.k."})
 
 
 def _presidio_model_path() -> Path | None:
@@ -786,9 +867,28 @@ def _presidio_matches(text: str, enabled: set[str], context: list[str] | None = 
         if score < _PRESIDIO_MIN_SCORE:
             continue
         confidence = CONFIRMED if score >= 0.85 else LIKELY if score >= 0.65 else POSSIBLE
-        matches.append(_mk(text, category, start, end,
-                           f"presidio:{result.entity_type}:{score:.2f}",
-                           confidence))
+        evidence = f"presidio:{result.entity_type}:{score:.2f}"
+
+        if category == "names":
+            # spaCy's PERSON label fires on headers, ratios and digit strings.
+            # Subject statistical names to the same credibility rules the
+            # deterministic detector uses instead of admitting raw model spans.
+            s, e, val = _trim_name_match(start, end, text[start:end], text, evidence)
+            if not val or any(ch.isdigit() for ch in val):
+                continue
+            matches.append(_mk(text, category, s, e, evidence, confidence))
+            continue
+
+        if category == "addresses":
+            val = text[start:end].strip()
+            tokens = val.split()
+            if (any(ch.isdigit() for ch in val)
+                    or (len(tokens) == 1
+                        and val.lower().strip(".,")
+                        in (_names._FIRST_STOP | _names._LAST_STOP | _LOCATION_STOP))):
+                continue
+
+        matches.append(_mk(text, category, start, end, evidence, confidence))
     return matches
 
 
@@ -999,7 +1099,10 @@ def detect(text: str,
             add_orig(m.start(), m.end(), "custom", "custom_literal", CONFIRMED)
 
     # PASS 7 — overlap resolution
-    return _dedupe(matches)
+    if "addresses" in enabled:
+        matches = [m for m in matches
+                   if not (m.category == "addresses" and _bare_zip_without_context(orig, m))]
+    return _dedupe(matches, orig)
 
 
 def detect_summary(text: str,
